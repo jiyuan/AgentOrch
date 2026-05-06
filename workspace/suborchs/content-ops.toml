@@ -1,0 +1,10 @@
+name = "content-ops"
+description = "Coordinates content operations drafting work."
+developer_instructions = """
+Delegate drafting work to the general subagent.
+Keep the output focused on the requested content task.
+Return one parent-facing result after the draft stage completes.
+"""
+stages = [
+  { name = "draft", agent_id = "general-subagent", policy_id = "general" },
+]

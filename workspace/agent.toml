@@ -1,0 +1,139 @@
+[agent]
+id = "default"
+orchestrator = "builtin.max"
+memory = "memory.in_memory"
+max_turns = 16
+
+[policy]
+default = "deny"
+
+[memory]
+backend = "sqlite"
+default_domain = "general"
+hydration_enabled = true
+hydrate_max_fragments = 5
+hydrate_max_estimated_tokens = 1200
+hydrate_stores = ["semantic", "episodic"]
+episode_recording_enabled = true
+semantic_backend = "sqlite_vec"  # aliases: "sqlite_vec", "qdrant", "none"
+
+[memory.sqlite_vec]
+table = "memory_records_vec"
+vector_dimensions = 384
+
+[memory.retention]
+max_records = 10000
+
+[memory.policy]
+writes = "ask_user"
+forgets = "ask_user"
+shared_writes = false
+
+[[memory.shared_domains]]
+name = "agentos"
+read = true
+write = false
+
+[channels.tui]
+enabled = true
+capacity = 64
+
+[channels.telegram]
+enabled = false
+capacity = 64
+mode = "poll_once"
+bot_token_env = "AGENTOS_TELEGRAM_BOT_TOKEN"
+chat_id_env = "AGENTOS_TELEGRAM_CHAT_ID"
+
+[channels.feishu]
+enabled = false
+capacity = 64
+mode = "long_connection"
+app_id_env = "AGENTOS_FEISHU_APP_ID"
+app_secret_env = "AGENTOS_FEISHU_APP_SECRET"
+chat_id_env = "AGENTOS_FEISHU_ALLOWED_ID"
+
+[isolation]
+worker_path_env = "AGENTOS_TOOL_WORKER_PATH"
+
+[resources]
+priority = ["skills", "tools", "mcp", "llm"]
+
+[resources.skills]
+enabled = ["skill-creator", "web-research"]
+
+[resources.tools]
+enabled = ["file", "http", "memory", "shell"]
+
+[resources.mcp]
+enabled = ["remote_echo"]
+
+[resources.llm]
+enabled = ["llm"]
+
+[task_workspace]
+root = "tasks"
+
+[[mcp_servers]]
+id = "static-mcp"
+endpoint = "static://local"
+timeout_ms = 10000
+
+[[mcp_tools]]
+server_id = "static-mcp"
+name = "remote_echo"
+description = "Static MCP-backed echo tool"
+response = "static MCP response"
+
+[[routing.rules]]
+domain = "software_dev"
+description = "Implementation, debugging, refactoring, tests, architecture, code review, and repository maintenance."
+examples = [
+  "fix this failing test",
+  "implement the orchestrator plan",
+  "review the TUI code path",
+]
+dispatch = "escalate"
+template = "software-dev"
+
+[[routing.rules]]
+domain = "content_ops"
+description = "Content planning, publishing, campaigns, editorial workflows, and content operations."
+examples = [
+  "draft a campaign plan",
+  "prepare this post for publishing",
+]
+dispatch = "escalate"
+template = "content-ops"
+
+[[routing.rules]]
+domain = "research"
+description = "Investigation, source review, evidence gathering, comparison, and synthesis."
+examples = [
+  "compare these sources",
+  "investigate the latest implementation options",
+]
+dispatch = "escalate"
+template = "research"
+
+[[routing.rules]]
+domain = "editing"
+description = "Rewrite, proofread, copy edit, clarify, or improve existing prose without changing the underlying task."
+examples = [
+  "rewrite this message",
+  "proofread this section",
+]
+dispatch = "delegate"
+agent_id = "edit-subagent"
+policy_id = "edit"
+
+[routing.fallback]
+domain = "general"
+description = "General chat and unclassified prompts that do not clearly match a specialized route."
+examples = [
+  "answer this general question",
+  "help me think through this",
+]
+dispatch = "delegate"
+agent_id = "general-subagent"
+policy_id = "general"

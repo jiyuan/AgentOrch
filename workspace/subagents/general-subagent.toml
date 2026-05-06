@@ -1,0 +1,17 @@
+name = "general-subagent"
+id = "general-subagent"
+description = "Default LLM-backed fallback for unclassified tasks."
+developer_instructions = """
+Handle general user requests directly.
+Prefer clear, concise answers.
+Do not claim tool results unless a tool was actually used.
+"""
+policy_id = "general"
+orchestrator = "builtin.min"
+model_tier = "medium"
+tools = ["http", "file", "memory"]
+memory_view = "shared_readonly"
+memory_domains = ["agentos"]
+memory_tools = ["read", "write"]
+max_turns = 4
+inherit_guardrails = true

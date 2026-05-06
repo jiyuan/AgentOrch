@@ -1,0 +1,378 @@
+//! Provider-neutral LLM interface and environment-backed provider adapters.
+
+pub mod env;
+pub mod providers;
+
+use agentos_interfaces::orchestrator::{Orchestrator, OrchestratorError, Plan, RunContext};
+use agentos_proto::{Message, MessageRole};
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use std::env as std_env;
+use std::sync::Arc;
+use thiserror::Error;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LlmRequest {
+    pub model: Arc<str>,
+    pub messages: Vec<Message>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LlmResponse {
+    pub message: Message,
+}
+
+#[derive(Debug, Error)]
+pub enum LlmError {
+    #[error("llm provider failed: {0}")]
+    Provider(Arc<str>),
+    #[error("llm is not configured for {0} tier")]
+    Unconfigured(Arc<str>),
+}
+
+#[async_trait]
+pub trait Llm: Send + Sync {
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn describe(&self) -> String {
+        "llm provider=custom".to_owned()
+    }
+
+    async fn complete(&self, ctx: &RunContext<'_>) -> Result<Message, LlmError>;
+
+    async fn complete_messages(&self, _messages: &[Message]) -> Result<Message, LlmError> {
+        Err(LlmError::Unconfigured(Arc::from("messages")))
+    }
+}
+
+pub struct LlmOrchestrator {
+    llm: Arc<dyn Llm>,
+}
+
+impl LlmOrchestrator {
+    pub fn new(llm: Arc<dyn Llm>) -> Self {
+        Self { llm }
+    }
+}
+
+#[async_trait]
+impl Orchestrator for LlmOrchestrator {
+    async fn plan(&self, ctx: &RunContext<'_>) -> Result<Plan, OrchestratorError> {
+        let response = self
+            .llm
+            .complete(ctx)
+            .await
+            .map_err(|err| OrchestratorError::Backend(Arc::from(err.to_string())))?;
+        Ok(Plan::Reply(response))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LlmModelTier {
+    High,
+    Medium,
+    Low,
+}
+
+impl LlmModelTier {
+    pub fn from_config(input: &str) -> Result<Self, String> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "high" => Ok(Self::High),
+            "medium" | "" => Ok(Self::Medium),
+            "low" => Ok(Self::Low),
+            other => Err(format!(
+                "unknown model_tier '{other}'; expected high, medium, or low"
+            )),
+        }
+    }
+
+    pub fn env_suffix(self) -> &'static str {
+        match self {
+            Self::High => "HIGH",
+            Self::Medium => "MEDIUM",
+            Self::Low => "LOW",
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LlmSelection {
+    pub provider: Arc<str>,
+    pub model: Arc<str>,
+}
+
+impl LlmSelection {
+    pub fn label(&self) -> String {
+        format!("{}:{}", self.provider, self.model)
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct LlmModelController {
+    override_selection: Arc<std::sync::Mutex<Option<LlmSelection>>>,
+}
+
+impl LlmModelController {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn set_override(&self, input: &str) -> Result<LlmSelection, String> {
+        let selection = parse_model_identifier(input, None)?;
+        validate_llm_selection(&selection)?;
+        if let Ok(mut guard) = self.override_selection.lock() {
+            *guard = Some(selection.clone());
+        }
+        Ok(selection)
+    }
+
+    pub fn clear_override(&self) {
+        if let Ok(mut guard) = self.override_selection.lock() {
+            *guard = None;
+        }
+    }
+
+    pub fn override_selection(&self) -> Option<LlmSelection> {
+        self.override_selection
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+}
+
+#[derive(Clone)]
+pub struct EnvLlm {
+    tier: LlmModelTier,
+    fallback: Option<LlmSelection>,
+    controller: LlmModelController,
+}
+
+impl EnvLlm {
+    pub fn new(tier: LlmModelTier, controller: LlmModelController) -> Result<Self, String> {
+        let fallback = configured_selection_for_tier(tier)?;
+        if let Some(selection) = &fallback {
+            validate_llm_selection(selection)?;
+        }
+        Ok(Self {
+            tier,
+            fallback,
+            controller,
+        })
+    }
+
+    pub fn current_selection(&self) -> Option<LlmSelection> {
+        self.controller
+            .override_selection()
+            .or_else(|| self.fallback.clone())
+    }
+}
+
+#[async_trait]
+impl Llm for EnvLlm {
+    fn is_available(&self) -> bool {
+        self.current_selection().is_some()
+    }
+
+    fn describe(&self) -> String {
+        match self.current_selection() {
+            Some(selection) if selection.provider.as_ref() == "openai" => format!(
+                "llm provider={}, model={}, tier={}, openai_org={}, openai_project={}",
+                selection.provider,
+                selection.model,
+                self.tier.env_suffix(),
+                env_presence(&["OPENAI_ORGANIZATION", "OPENAI_ORG_ID"]),
+                env_presence(&["OPENAI_PROJECT", "OPENAI_PROJECT_ID"])
+            ),
+            Some(selection) => format!(
+                "llm provider={}, model={}, tier={}",
+                selection.provider,
+                selection.model,
+                self.tier.env_suffix()
+            ),
+            None => "llm provider=builtin.echo".to_owned(),
+        }
+    }
+
+    async fn complete(&self, ctx: &RunContext<'_>) -> Result<Message, LlmError> {
+        let messages = ctx
+            .state
+            .transcript
+            .items
+            .iter()
+            .map(|item| item.message.clone())
+            .collect::<Vec<_>>();
+        self.complete_messages(&messages).await
+    }
+
+    async fn complete_messages(&self, messages: &[Message]) -> Result<Message, LlmError> {
+        let Some(selection) = self.current_selection() else {
+            return Err(LlmError::Unconfigured(Arc::from(self.tier.name())));
+        };
+        validate_llm_selection(&selection).map_err(|err| LlmError::Provider(Arc::from(err)))?;
+        let messages = messages.iter().map(chat_message).collect::<Vec<_>>();
+        let content = match selection.provider.as_ref() {
+            "openai" => providers::openai::complete(&selection.model, &messages),
+            "anthropic" => providers::anthropic::complete(&selection.model, &messages),
+            "deepseek" => providers::deepseek::complete(&selection.model, &messages),
+            "ollama" => providers::ollama::complete(&selection.model, &messages),
+            other => Err(format!("unknown LLM provider: {other}")),
+        }
+        .map_err(|err| LlmError::Provider(Arc::from(err)))?;
+        Ok(Message::text(MessageRole::Assistant, content))
+    }
+}
+
+pub fn configured_selection_for_tier(tier: LlmModelTier) -> Result<Option<LlmSelection>, String> {
+    let provider_config =
+        std_env::var("AGENTOS_LLM_PROVIDER").unwrap_or_else(|_| infer_llm_provider());
+    let model_config = std_env::var(format!("AGENTOS_LLM_MODEL_{}", tier.env_suffix()))
+        .ok()
+        .filter(|model| !model.trim().is_empty())
+        .or_else(|| {
+            std_env::var("AGENTOS_LLM_MODEL")
+                .ok()
+                .filter(|model| !model.trim().is_empty())
+        });
+
+    if let Some(model_config) = model_config {
+        let default_provider = provider_config
+            .split_once(':')
+            .map_or(provider_config.as_str(), |(provider, _)| provider);
+        if default_provider == "builtin.echo" && !model_config.contains(':') {
+            return Ok(None);
+        }
+        return parse_model_identifier(&model_config, Some(default_provider)).map(Some);
+    }
+
+    if provider_config.contains(':') {
+        return parse_model_identifier(&provider_config, None).map(Some);
+    }
+    if provider_config == "builtin.echo" {
+        return Ok(None);
+    }
+    let model = default_model_for_provider(&provider_config);
+    if model.is_empty() {
+        return Err(format!("unknown AGENTOS_LLM_PROVIDER: {provider_config}"));
+    }
+    Ok(Some(LlmSelection {
+        provider: Arc::from(provider_config),
+        model: Arc::from(model),
+    }))
+}
+
+pub fn parse_model_identifier(
+    input: &str,
+    default_provider: Option<&str>,
+) -> Result<LlmSelection, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("model identifier cannot be empty".to_owned());
+    }
+    let (provider, model) = match trimmed.split_once(':') {
+        Some((provider, model)) => (provider.trim(), model.trim()),
+        None => (
+            default_provider.ok_or_else(|| {
+                "model identifier must use provider:model, for example openai:gpt-5.4-mini"
+                    .to_owned()
+            })?,
+            trimmed,
+        ),
+    };
+    let provider = provider.to_ascii_lowercase();
+    if provider.is_empty() || model.is_empty() {
+        return Err("model identifier must use provider:model with both parts set".to_owned());
+    }
+    if provider == "builtin.echo" {
+        return Err("builtin.echo is not a selectable LLM model".to_owned());
+    }
+    if !matches!(
+        provider.as_str(),
+        "openai" | "anthropic" | "deepseek" | "ollama"
+    ) {
+        return Err(format!("unknown LLM provider: {provider}"));
+    }
+    Ok(LlmSelection {
+        provider: Arc::from(provider),
+        model: Arc::from(model.to_owned()),
+    })
+}
+
+pub fn validate_llm_selection(selection: &LlmSelection) -> Result<(), String> {
+    match selection.provider.as_ref() {
+        "openai" => require_env_var("OPENAI_API_KEY")?,
+        "anthropic" => require_env_var("ANTHROPIC_API_KEY")?,
+        "deepseek" => require_env_var("DEEPSEEK_API_KEY")?,
+        "ollama" => {}
+        _ => return Err(format!("unknown LLM provider: {}", selection.provider)),
+    }
+    Ok(())
+}
+
+pub fn default_model_for_provider(provider: &str) -> String {
+    match provider {
+        "openai" => "gpt-5.4-mini".to_owned(),
+        "anthropic" => "claude-sonnet-4-5".to_owned(),
+        "deepseek" => "deepseek-chat".to_owned(),
+        "ollama" => "llama3.2".to_owned(),
+        _ => String::new(),
+    }
+}
+
+pub fn infer_llm_provider() -> String {
+    if std_env::var_os("OPENAI_API_KEY").is_some() {
+        "openai".to_owned()
+    } else if std_env::var_os("ANTHROPIC_API_KEY").is_some() {
+        "anthropic".to_owned()
+    } else if std_env::var_os("DEEPSEEK_API_KEY").is_some() {
+        "deepseek".to_owned()
+    } else if std_env::var_os("OLLAMA_HOST").is_some() {
+        "ollama".to_owned()
+    } else {
+        "builtin.echo".to_owned()
+    }
+}
+
+fn require_env_var(name: &str) -> Result<(), String> {
+    if std_env::var_os(name).is_none() {
+        return Err(format!(
+            "{name} is required for the configured LLM provider"
+        ));
+    }
+    Ok(())
+}
+
+fn env_presence(names: &[&str]) -> &'static str {
+    if names.iter().any(|name| std_env::var_os(name).is_some()) {
+        "set"
+    } else {
+        "unset"
+    }
+}
+
+fn chat_message(message: &Message) -> serde_json::Value {
+    let role = match message.role {
+        MessageRole::Assistant => "assistant",
+        MessageRole::System => "system",
+        MessageRole::Tool | MessageRole::User => "user",
+    };
+    let content = if message.role == MessageRole::Tool {
+        format!("Tool result: {}", message.content)
+    } else {
+        message.content.to_string()
+    };
+    serde_json::json!({
+        "role": role,
+        "content": content
+    })
+}
+

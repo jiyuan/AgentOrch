@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    "crates/agentos-cli",
+    "crates/agentos-core",
+    "crates/agentos-interfaces",
+    "crates/agentos-llm",
+    "crates/agentos-proto",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/agentos"
+
+[workspace.dependencies]
+agentos-core = { path = "crates/agentos-core" }
+agentos-interfaces = { path = "crates/agentos-interfaces" }
+agentos-llm = { path = "crates/agentos-llm" }
+agentos-proto = { path = "crates/agentos-proto" }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["raw_value"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+sqlite-vec = "0.1.9"
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }

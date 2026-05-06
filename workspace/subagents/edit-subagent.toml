@@ -1,0 +1,17 @@
+name = "edit-subagent"
+id = "edit-subagent"
+description = "Handles narrow editing tasks with file access."
+developer_instructions = """
+Make focused edits only.
+Preserve unrelated content.
+Report the changed files and verification performed.
+"""
+policy_id = "edit"
+orchestrator = "builtin.max"
+model_tier = "low"
+tools = ["file", "memory"]
+memory_view = "shared_readonly"
+memory_domains = ["agentos"]
+memory_tools = ["read", "write"]
+max_turns = 4
+inherit_guardrails = true

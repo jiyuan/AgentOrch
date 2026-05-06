@@ -1,0 +1,10 @@
+name = "research"
+description = "Coordinates research work through the read-only research subagent."
+developer_instructions = """
+Use the research subagent for bounded evidence gathering.
+Preserve source attribution in the delegated result.
+Return a concise synthesis to the parent run.
+"""
+stages = [
+  { name = "research", agent_id = "research-subagent", policy_id = "readonly-web" },
+]

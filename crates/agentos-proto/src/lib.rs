@@ -1,0 +1,18 @@
+//! Serializable wire types shared across Agent OS crates and process boundaries.
+
+pub mod envelope;
+pub mod ids;
+pub mod message;
+pub mod tool;
+pub mod trace;
+pub mod usage;
+
+pub use envelope::Envelope;
+pub use ids::{
+    AgentId, ChannelId, ConversationId, InterruptionId, Namespace, RecordId, RunId, SchemaVersion,
+    SpanId, TaskId, ToolCallId,
+};
+pub use message::{Message, MessageRole};
+pub use tool::{ToolCall, ToolResult, ToolStatus};
+pub use trace::{SpanKind, TraceEvent, TraceSpan};
+pub use usage::Usage;

@@ -1,0 +1,50 @@
+{"active_agent":"echo-agent","channel_id":"tui","conversation_id":"terminal","event":"session_started","phase":"run","run_id":"cli-run-1"}
+{"active_agent":"echo-agent","channel_id":"tui","conversation_id":"terminal","event":"session_started","phase":"run","run_id":"cli-run-1"}{"event":"input","message":{"content":"shell: rm -rf /tmp/nope","role":"user"},"metadata":{}}{"active_agent":"echo-agent","channel_id":"tui","conversation_id":"terminal","event":"session_started","phase":"run","run_id":"cli-run-1"}
+
+{"active_agent":"echo-agent","channel_id":"tui","conversation_id":"terminal","event":"session_started","phase":"run","run_id":"cli-run-1"}
+{"active_agent":"echo-agent","channel_id":"tui","conversation_id":"terminal","event":"session_started","phase":"run","run_id":"cli-run-1"}
+
+{"active_agent":"echo-agent","channel_id":"tui","conversation_id":"terminal","event":"session_started","phase":"run","run_id":"cli-run-1"}{"active_agent":"echo-agent","channel_id":"tui","conversation_id":"terminal","event":"session_started","phase":"run","run_id":"cli-run-1"}{"active_agent":"echo-agent","channel_id":"tui","conversation_id":"terminal","event":"session_started","phase":"run","run_id":"cli-run-1"}
+
+{"event":"input","message":{"content":"hello from env file","role":"user"},"metadata":{}}{"active_agent":"echo-agent","channel_id":"tui","conversation_id":"terminal","event":"session_started","phase":"run","run_id":"cli-run-1"}
+{"event":"input","message":{"content":"hello cli","role":"user"},"metadata":{}}
+
+
+{"event":"input","message":{"content":"remember: phase4 stores facts","role":"user"},"metadata":{}}{"event":"input","message":{"content":"hello llm","role":"user"},"metadata":{}}{"event":"input","message":{"content":"hello switched model","role":"user"},"metadata":{}}
+
+{"event":"input","message":{"content":"shell: printf should-not-run","role":"user"},"metadata":{}}
+{"event":"input","message":{"content":"shell: printf cli-tool","role":"user"},"metadata":{}}
+
+{"event":"input","message":{"content":"hello deepseek","role":"user"},"metadata":{}}
+{"event":"transcript_item","index":0,"message":{"content":"shell: rm -rf /tmp/nope","role":"user"},"metadata":{},"phase":"paused"}
+{"event":"session_finished","phase":"paused"}
+{"event":"transcript_item","index":0,"message":{"content":"hello cli","role":"user"},"metadata":{},"phase":"finished"}
+{"event":"transcript_item","index":1,"message":{"content":"hello cli","role":"assistant"},"metadata":{},"phase":"finished"}
+{"event":"transcript_item","index":0,"message":{"content":"shell: printf cli-tool","role":"user"},"metadata":{},"phase":"paused"}
+{"event":"session_finished","phase":"finished"}
+{"event":"session_finished","phase":"paused"}
+{"event":"transcript_item","index":0,"message":{"content":"remember: phase4 stores facts","role":"user"},"metadata":{},"phase":"finished"}
+{"event":"transcript_item","index":1,"message":{"content":"remembered: phase4 stores facts","metadata":{"bytes_out":31,"duration_ms":2,"namespace":"facts","operation":"write","record_id":"record-1","tool_call_id":"call-1","tool_status":"succeeded"},"role":"tool"},"metadata":{},"phase":"finished"}
+{"event":"transcript_item","index":2,"message":{"content":"remembered: phase4 stores facts","role":"assistant"},"metadata":{},"phase":"finished"}
+{"event":"session_finished","phase":"finished"}
+{"active_agent":"echo-agent","channel_id":"tui","conversation_id":"terminal","event":"session_started","phase":"run","run_id":"cli-run-1"}
+{"event":"input","message":{"content":"recall: phase4","role":"user"},"metadata":{}}
+{"event":"transcript_item","index":0,"message":{"content":"recall: phase4","role":"user"},"metadata":{},"phase":"finished"}
+{"event":"transcript_item","index":1,"message":{"content":"memories:\n- phase4 stores facts","metadata":{"bytes_out":31,"count":1,"duration_ms":0,"namespace":"facts","operation":"read","tool_call_id":"call-1","tool_status":"succeeded"},"role":"tool"},"metadata":{},"phase":"finished"}
+{"event":"transcript_item","index":2,"message":{"content":"memories:\n- phase4 stores facts","role":"assistant"},"metadata":{},"phase":"finished"}
+{"event":"session_finished","phase":"finished"}
+{"event":"transcript_item","index":0,"message":{"content":"hello from env file","role":"user"},"metadata":{},"phase":"finished"}
+{"event":"transcript_item","index":1,"message":{"content":"env file llm reply","role":"assistant"},"metadata":{},"phase":"finished"}
+{"event":"session_finished","phase":"finished"}
+{"event":"transcript_item","index":0,"message":{"content":"hello llm","role":"user"},"metadata":{},"phase":"finished"}
+{"event":"transcript_item","index":1,"message":{"content":"llm says hi","role":"assistant"},"metadata":{},"phase":"finished"}
+{"event":"session_finished","phase":"finished"}
+{"event":"transcript_item","index":0,"message":{"content":"hello deepseek","role":"user"},"metadata":{},"phase":"finished"}
+{"event":"transcript_item","index":1,"message":{"content":"deepseek says hi","role":"assistant"},"metadata":{},"phase":"finished"}
+{"event":"session_finished","phase":"finished"}
+{"event":"transcript_item","index":0,"message":{"content":"shell: printf should-not-run","role":"user"},"metadata":{},"phase":"finished"}
+{"event":"transcript_item","index":1,"message":{"content":"min handled shell text","role":"assistant"},"metadata":{},"phase":"finished"}
+{"event":"session_finished","phase":"finished"}
+{"event":"transcript_item","index":0,"message":{"content":"hello switched model","role":"user"},"metadata":{},"phase":"finished"}
+{"event":"transcript_item","index":1,"message":{"content":"deepseek runtime reply","role":"assistant"},"metadata":{},"phase":"finished"}
+{"event":"session_finished","phase":"finished"}

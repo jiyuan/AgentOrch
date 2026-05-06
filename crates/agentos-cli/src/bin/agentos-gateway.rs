@@ -1,0 +1,889 @@
+use agentos_core::channels::{feishu::FeishuChannel, telegram::TelegramChannel};
+use agentos_core::gateway::{GatewayRun, GatewayService};
+use agentos_core::runner::ResumeDecision;
+use agentos_core::runtime::{AgentRuntime, RuntimePaths};
+use agentos_interfaces::Channel;
+use agentos_llm::env as agentos_env;
+use agentos_proto::{Envelope, Message, MessageRole, RunId, SpanKind};
+use std::collections::BTreeMap;
+use std::env;
+use std::fs::{self, OpenOptions};
+use std::path::{Path, PathBuf};
+use std::process::{self, Command, Stdio};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const DEFAULT_PID_PATH: &str = "workspace/run/agentos-gateway.pid";
+const DEFAULT_LOG_PATH: &str = "logs/agentos-gateway.log";
+const OWNER_TOKEN_ENV: &str = "AGENTOS_GATEWAY_OWNER_TOKEN";
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn setsid() -> i32;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ServiceConfig {
+    pid_path: PathBuf,
+    log_path: PathBuf,
+    agent_config_path: Option<PathBuf>,
+    session_db_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PidRecord {
+    pid: u32,
+    owner_token: Option<String>,
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self {
+            pid_path: env::var_os("AGENTOS_GATEWAY_PID_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_PID_PATH)),
+            log_path: env::var_os("AGENTOS_GATEWAY_LOG_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_LOG_PATH)),
+            agent_config_path: env::var_os("AGENTOS_AGENT_CONFIG_PATH").map(PathBuf::from),
+            session_db_path: env::var_os("AGENTOS_SESSION_DB_PATH").map(PathBuf::from),
+        }
+    }
+}
+
+fn main() {
+    if let Err(err) = run() {
+        eprintln!("{err}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), String> {
+    let args = env::args().skip(1).collect::<Vec<_>>();
+    load_startup_env(&args)?;
+    let mut args = args.into_iter();
+    let Some(command) = args.next() else {
+        usage();
+        return Err("missing subcommand".to_owned());
+    };
+    let config = parse_config(args)?;
+
+    match command.as_str() {
+        "start" => start(config),
+        "stop" => stop(&config),
+        "restart" => {
+            stop_if_running(&config)?;
+            start(config)
+        }
+        "status" => status(&config),
+        "serve" => serve(&config),
+        "-h" | "--help" | "help" => {
+            usage();
+            Ok(())
+        }
+        other => Err(format!("unknown subcommand: {other}")),
+    }
+}
+
+fn usage() {
+    eprintln!(
+        "\
+Usage: agentos-gateway <start|stop|restart|status> [OPTIONS]
+
+Manage the AgentOS gateway as a persistent background service.
+
+Subcommands:
+  start      Start the gateway service in the background.
+  stop       Stop the running gateway service.
+  restart    Stop then start the gateway service.
+  status     Report whether the gateway service is running.
+
+Options:
+  --pid-path PATH             PID file. Default: {DEFAULT_PID_PATH}
+  --log-path PATH             Log file. Default: {DEFAULT_LOG_PATH}
+  --config PATH               Agent workspace config path.
+  --session-db-path PATH      Session database path.
+  --env-file PATH             Environment file. Default: {}
+  --no-env-override           Keep already-exported shell variables over .env values.
+  -h, --help                  Show this help.
+
+Environment:
+  AGENTOS_ENV_FILE            Environment file. Default: {}
+  AGENTOS_NO_ENV_OVERRIDE     Set to 1 to keep shell variables over .env values.
+  AGENTOS_GATEWAY_PID_PATH    Default PID file path.
+  AGENTOS_GATEWAY_LOG_PATH    Default log file path.
+  AGENTOS_AGENT_CONFIG_PATH   Agent workspace config path.
+  AGENTOS_SESSION_DB_PATH     Session database path.",
+        agentos_env::DEFAULT_ENV_PATH,
+        agentos_env::DEFAULT_ENV_PATH
+    );
+}
+
+fn parse_config<I>(args: I) -> Result<ServiceConfig, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut config = ServiceConfig::default();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--pid-path" => {
+                config.pid_path = next_path(&mut args, "--pid-path")?;
+            }
+            "--log-path" => {
+                config.log_path = next_path(&mut args, "--log-path")?;
+            }
+            "--config" => {
+                config.agent_config_path = Some(next_path(&mut args, "--config")?);
+            }
+            "--session-db-path" => {
+                config.session_db_path = Some(next_path(&mut args, "--session-db-path")?);
+            }
+            "--env-file" => {
+                let _ = next_path(&mut args, "--env-file")?;
+            }
+            option if option.starts_with("--env-file=") => {}
+            "--no-env-override" => {}
+            "-h" | "--help" => {
+                usage();
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown option: {other}")),
+        }
+    }
+    Ok(config)
+}
+
+fn next_path<I>(args: &mut I, option: &str) -> Result<PathBuf, String>
+where
+    I: Iterator<Item = String>,
+{
+    args.next()
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("{option} requires a path"))
+}
+
+fn load_startup_env(args: &[String]) -> Result<(), String> {
+    let loaded = agentos_env::load_startup_env(&agentos_env::EnvLoadOptions {
+        explicit_path: discover_env_path_arg(args)?,
+        search_parent_dirs: false,
+        allow_overrides: agentos_env::allow_env_overrides()
+            && !args.iter().any(|arg| arg == "--no-env-override"),
+    })?;
+    if let Some(path) = loaded {
+        eprintln!("Loaded environment file: {}", path.display());
+    }
+    Ok(())
+}
+
+fn discover_env_path_arg(args: &[String]) -> Result<Option<PathBuf>, String> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--env-file" {
+            let Some(path) = iter.next() else {
+                return Err("--env-file requires a path".to_owned());
+            };
+            return Ok(Some(PathBuf::from(path)));
+        } else if let Some(value) = arg.strip_prefix("--env-file=") {
+            return Ok(Some(PathBuf::from(value)));
+        }
+    }
+    Ok(None)
+}
+
+fn start(config: ServiceConfig) -> Result<(), String> {
+    ensure_parent_dir(&config.pid_path)?;
+    ensure_parent_dir(&config.log_path)?;
+
+    if let Some(pid) = read_pid(&config.pid_path)? {
+        if process_is_running(pid) {
+            println!(
+                "AgentOS gateway is already running: pid {pid}, pid file {}",
+                config.pid_path.display()
+            );
+            return Ok(());
+        }
+        eprintln!(
+            "Removing stale AgentOS gateway pid file: {}",
+            config.pid_path.display()
+        );
+        fs::remove_file(&config.pid_path).map_err(|err| {
+            format!(
+                "failed to remove stale pid file {}: {err}",
+                config.pid_path.display()
+            )
+        })?;
+    }
+
+    let exe = env::current_exe().map_err(|err| format!("failed to locate executable: {err}"))?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&config.log_path)
+        .map_err(|err| format!("failed to open log {}: {err}", config.log_path.display()))?;
+    let err_log = log
+        .try_clone()
+        .map_err(|err| format!("failed to clone log handle: {err}"))?;
+
+    let owner_token = gateway_owner_token()?;
+    let mut command = Command::new(exe);
+    command
+        .arg("serve")
+        .arg("--pid-path")
+        .arg(&config.pid_path)
+        .arg("--log-path")
+        .arg(&config.log_path)
+        .env(OWNER_TOKEN_ENV, &owner_token)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(err_log));
+    if let Some(path) = &config.agent_config_path {
+        command.arg("--config").arg(path);
+    }
+    if let Some(path) = &config.session_db_path {
+        command.arg("--session-db-path").arg(path);
+    }
+    detach_gateway_process(&mut command);
+
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("failed to start gateway service: {err}"))?;
+    let pid = child.id();
+    write_pid_record(&config.pid_path, pid, Some(&owner_token))?;
+    thread::sleep(Duration::from_secs(1));
+    if let Some(status) = child
+        .try_wait()
+        .map_err(|err| format!("failed to inspect gateway service: {err}"))?
+    {
+        let _ = fs::remove_file(&config.pid_path);
+        return Err(format!(
+            "AgentOS gateway service exited during startup with {status}; see {}",
+            config.log_path.display()
+        ));
+    }
+    if !process_is_running(pid) {
+        let _ = fs::remove_file(&config.pid_path);
+        return Err(format!(
+            "AgentOS gateway service exited during startup; see {}",
+            config.log_path.display()
+        ));
+    }
+
+    println!(
+        "AgentOS gateway started: pid {pid}, pid file {}, log {}",
+        config.pid_path.display(),
+        config.log_path.display()
+    );
+    Ok(())
+}
+
+fn stop(config: &ServiceConfig) -> Result<(), String> {
+    let Some(pid) = read_pid(&config.pid_path)? else {
+        println!(
+            "AgentOS gateway is not running: pid file {} does not exist",
+            config.pid_path.display()
+        );
+        return Ok(());
+    };
+
+    if !process_is_running(pid) {
+        fs::remove_file(&config.pid_path).map_err(|err| {
+            format!(
+                "failed to remove stale pid file {}: {err}",
+                config.pid_path.display()
+            )
+        })?;
+        println!("AgentOS gateway was not running; removed stale pid file");
+        return Ok(());
+    }
+
+    send_signal(pid, "TERM")?;
+    for _ in 0..50 {
+        if !process_is_running(pid) {
+            let _ = fs::remove_file(&config.pid_path);
+            println!("AgentOS gateway stopped: pid {pid}");
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    send_signal(pid, "KILL")?;
+    let _ = fs::remove_file(&config.pid_path);
+    println!("AgentOS gateway killed after timeout: pid {pid}");
+    Ok(())
+}
+
+fn stop_if_running(config: &ServiceConfig) -> Result<(), String> {
+    if read_pid(&config.pid_path)?.is_some() {
+        stop(config)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn detach_gateway_process(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        command.pre_exec(|| {
+            if setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn detach_gateway_process(_command: &mut Command) {}
+
+fn status(config: &ServiceConfig) -> Result<(), String> {
+    let Some(pid) = read_pid(&config.pid_path)? else {
+        println!("AgentOS gateway status: stopped");
+        return Ok(());
+    };
+
+    if process_is_running(pid) {
+        println!("AgentOS gateway status: running, pid {pid}");
+    } else {
+        println!(
+            "AgentOS gateway status: stale pid file {}, pid {pid}",
+            config.pid_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn serve(config: &ServiceConfig) -> Result<(), String> {
+    ensure_parent_dir(&config.pid_path)?;
+    ensure_parent_dir(&config.log_path)?;
+    wait_for_pid_ownership(config)?;
+    log_line(config, "AgentOS gateway service starting")?;
+    log_line(
+        config,
+        &format!(
+            "config={}, session_db={}",
+            display_optional_path(&config.agent_config_path),
+            display_optional_path(&config.session_db_path)
+        ),
+    )?;
+
+    let channels = persistent_channels()?;
+    if !channels.is_empty() {
+        for channel in &channels {
+            log_line(config, &format!("{channel} channel enabled"))?;
+        }
+        return run_persistent_gateways(config, &channels);
+    }
+
+    log_line(
+        config,
+        "no persistent channels enabled; set AGENTOS_ENABLED_CHANNELS=telegram,feishu",
+    )?;
+    loop {
+        thread::sleep(Duration::from_secs(60));
+        if !pid_file_owned_by_current_process(config)? {
+            log_line(
+                config,
+                "AgentOS gateway exiting because pid file belongs to another process",
+            )?;
+            return Ok(());
+        }
+        log_line(config, "AgentOS gateway heartbeat")?;
+    }
+}
+
+fn run_persistent_gateways(
+    config: &ServiceConfig,
+    channels: &[&'static str],
+) -> Result<(), String> {
+    let mut handles = Vec::new();
+    for channel in channels {
+        let config = config.clone();
+        let channel = *channel;
+        let handle = thread::spawn(move || run_persistent_channel(&config, channel));
+        handles.push((channel, handle));
+    }
+
+    loop {
+        thread::sleep(Duration::from_secs(1));
+        if !pid_file_owned_by_current_process(config)? {
+            log_line(
+                config,
+                "AgentOS gateway exiting because pid file belongs to another process",
+            )?;
+            return Ok(());
+        }
+        let mut index = 0;
+        while index < handles.len() {
+            if handles[index].1.is_finished() {
+                let (channel, handle) = handles.remove(index);
+                match handle.join() {
+                    Ok(Ok(())) => {
+                        log_line(config, &format!("{channel} gateway loop exited"))?;
+                    }
+                    Ok(Err(err)) => {
+                        log_line(config, &format!("{channel} gateway loop failed: {err}"))?;
+                        return Err(err);
+                    }
+                    Err(_) => {
+                        let err = format!("{channel} gateway loop panicked");
+                        log_line(config, &err)?;
+                        return Err(err);
+                    }
+                }
+            } else {
+                index += 1;
+            }
+        }
+        if handles.is_empty() {
+            return Ok(());
+        }
+    }
+}
+
+fn run_persistent_channel(config: &ServiceConfig, channel: &'static str) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| format!("failed to start tokio runtime: {err}"))?;
+    match channel {
+        "telegram" => runtime.block_on(run_telegram_gateway(config)),
+        "feishu" => runtime.block_on(run_feishu_gateway(config)),
+        _ => Err(format!("unknown persistent channel: {channel}")),
+    }
+}
+
+async fn run_telegram_gateway(config: &ServiceConfig) -> Result<(), String> {
+    let channel = TelegramChannel::from_env()
+        .map_err(|err| format!("failed to configure telegram channel: {err}"))?
+        .with_receive_error_logging(true);
+    run_channel_gateway(config, channel, "telegram", RunId::new("telegram-gateway")).await
+}
+
+async fn run_feishu_gateway(config: &ServiceConfig) -> Result<(), String> {
+    let channel = FeishuChannel::from_env()
+        .map_err(|err| format!("failed to configure feishu channel: {err}"))?
+        .with_receive_error_logging(true);
+    run_channel_gateway(config, channel, "feishu", RunId::new("feishu-gateway")).await
+}
+
+async fn run_channel_gateway<C>(
+    config: &ServiceConfig,
+    mut channel: C,
+    channel_name: &str,
+    run_id: RunId,
+) -> Result<(), String>
+where
+    C: Channel,
+{
+    let runtime = AgentRuntime::build(RuntimePaths {
+        agent_config_path: agent_config_path(config),
+        session_db_path: session_path(config),
+        trace_dir: trace_dir_path(),
+    })
+    .await?;
+    log_line(config, &runtime.orchestrator.describe_llm())?;
+    let deps_scope = runtime.deps_scope();
+    let input_guardrails = deps_scope.input_guardrails();
+    let output_guardrails = deps_scope.output_guardrails();
+    let tool_guardrails = deps_scope.tool_guardrails();
+    let deps =
+        deps_scope.deps_with_guardrails(&input_guardrails, &output_guardrails, &tool_guardrails);
+    let gateway_service = GatewayService::new(&deps, Arc::from(runtime.active_agent.as_str()));
+    log_line(config, &format!("{channel_name} gateway loop started"))?;
+
+    loop {
+        if !pid_file_owned_by_current_process(config)? {
+            log_line(
+                config,
+                &format!(
+                    "{channel_name} gateway loop exiting because pid file belongs to another process"
+                ),
+            )?;
+            return Ok(());
+        }
+        let Some(mut input) = channel.receive().await else {
+            thread::sleep(Duration::from_secs(1));
+            continue;
+        };
+        if is_clear_command(&input.message.content) {
+            let removed = runtime
+                .session
+                .clear_session(&input.conversation_id)
+                .map_err(|err| {
+                    format!("failed to clear {channel_name} conversation history: {err}")
+                })?;
+            log_line(
+                config,
+                &format!(
+                    "{channel_name} conversation {} cleared ({removed} items)",
+                    input.conversation_id.as_str()
+                ),
+            )?;
+            if let Err(send_err) = channel
+                .send(command_reply_envelope(
+                    &input,
+                    runtime.active_agent.as_str(),
+                    &format!(
+                        "Cleared {} conversation history ({removed} items).",
+                        channel_display_name(channel_name)
+                    ),
+                ))
+                .await
+            {
+                log_line(
+                    config,
+                    &format!(
+                        "{channel_name} gateway failed to send clear confirmation: {send_err}"
+                    ),
+                )?;
+            }
+            continue;
+        }
+        input.metadata.insert(
+            Arc::from("task_id"),
+            serde_json::json!(runtime.orchestrator.current_strategy().task_id()),
+        );
+        match gateway_service
+            .run_envelope(&channel, input.clone(), run_id.clone())
+            .await
+        {
+            Ok(GatewayRun::Finished { state, .. }) => {
+                log_trace(config, &state)?;
+            }
+            Ok(GatewayRun::Paused { paused, .. }) => {
+                let Some(approval_id) = paused
+                    .state
+                    .pending_approvals
+                    .first()
+                    .map(|approval| approval.id.clone())
+                else {
+                    log_line(
+                        config,
+                        &format!("{channel_name} run paused without pending approval"),
+                    )?;
+                    continue;
+                };
+                let Some(answer) = channel.receive().await else {
+                    log_line(
+                        config,
+                        &format!("{channel_name} approval prompt sent; no approval received"),
+                    )?;
+                    continue;
+                };
+                let decision = if answer.message.content.trim().eq_ignore_ascii_case("y") {
+                    ResumeDecision::Approve
+                } else {
+                    ResumeDecision::Reject {
+                        reason: Arc::from(format!("rejected by {channel_name} user")),
+                    }
+                };
+                match gateway_service
+                    .resume(&channel, paused, &approval_id, decision)
+                    .await
+                {
+                    Ok(GatewayRun::Finished { state, .. }) => log_trace(config, &state)?,
+                    Ok(GatewayRun::Paused { .. }) => {
+                        log_line(
+                            config,
+                            &format!("{channel_name} run paused again after resume"),
+                        )?;
+                    }
+                    Err(err) => {
+                        log_line(config, &format!("{channel_name} resume failed: {err}"))?;
+                    }
+                }
+            }
+            Err(err) => {
+                log_line(config, &format!("{channel_name} gateway run failed: {err}"))?;
+                if let Err(send_err) = channel
+                    .send(failure_envelope(
+                        &input,
+                        runtime.active_agent.as_str(),
+                        &err.to_string(),
+                    ))
+                    .await
+                {
+                    log_line(
+                        config,
+                        &format!("{channel_name} gateway failed to send error reply: {send_err}"),
+                    )?;
+                }
+                thread::sleep(Duration::from_secs(5));
+            }
+        }
+    }
+}
+
+fn persistent_channels() -> Result<Vec<&'static str>, String> {
+    if let Ok(channels) = env::var("AGENTOS_ENABLED_CHANNELS") {
+        let mut enabled = Vec::new();
+        for channel in channels.split(',').map(str::trim) {
+            match channel {
+                "" | "tui" => {}
+                "telegram" => push_unique_channel(&mut enabled, "telegram"),
+                "feishu" => push_unique_channel(&mut enabled, "feishu"),
+                other => return Err(format!("unknown persistent channel: {other}")),
+            }
+        }
+        return Ok(enabled);
+    }
+
+    let telegram_configured = env::var_os("AGENTOS_TELEGRAM_BOT_TOKEN").is_some();
+    let feishu_configured = env::var_os("AGENTOS_FEISHU_APP_ID").is_some();
+    let mut enabled = Vec::new();
+    if telegram_configured {
+        enabled.push("telegram");
+    }
+    if feishu_configured {
+        enabled.push("feishu");
+    }
+    Ok(enabled)
+}
+
+fn push_unique_channel(channels: &mut Vec<&'static str>, channel: &'static str) {
+    if !channels.contains(&channel) {
+        channels.push(channel);
+    }
+}
+
+fn channel_display_name(name: &str) -> &str {
+    match name {
+        "feishu" => "Feishu",
+        "telegram" => "Telegram",
+        _ => "channel",
+    }
+}
+
+fn agent_config_path(config: &ServiceConfig) -> PathBuf {
+    config
+        .agent_config_path
+        .clone()
+        .or_else(|| env::var_os("AGENTOS_AGENT_CONFIG_PATH").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("workspace/agent.toml"))
+}
+
+fn session_path(config: &ServiceConfig) -> PathBuf {
+    config
+        .session_db_path
+        .clone()
+        .or_else(|| env::var_os("AGENTOS_SESSION_DB_PATH").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("workspace/agentos.sqlite"))
+}
+
+fn trace_dir_path() -> PathBuf {
+    env::var_os("AGENTOS_TRACE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("workspace/traces"))
+}
+
+fn log_trace(config: &ServiceConfig, state: &agentos_interfaces::RunState) -> Result<(), String> {
+    log_line(
+        config,
+        &format!(
+            "trace: run={}, plan={}, llm={}",
+            count_spans(state, SpanKind::Run),
+            count_named_spans(state, SpanKind::State, "plan"),
+            count_spans(state, SpanKind::Llm)
+        ),
+    )
+}
+
+fn count_spans(state: &agentos_interfaces::RunState, kind: SpanKind) -> usize {
+    state
+        .trace_spans
+        .iter()
+        .filter(|span| span.kind == kind)
+        .count()
+}
+
+fn count_named_spans(state: &agentos_interfaces::RunState, kind: SpanKind, name: &str) -> usize {
+    state
+        .trace_spans
+        .iter()
+        .filter(|span| span.kind == kind && span.name.as_ref() == name)
+        .count()
+}
+
+fn failure_envelope(input: &Envelope, sender: &str, error: &str) -> Envelope {
+    command_reply_envelope(input, sender, &user_facing_error_message(error))
+}
+
+fn command_reply_envelope(input: &Envelope, sender: &str, content: &str) -> Envelope {
+    Envelope {
+        channel_id: input.channel_id.clone(),
+        conversation_id: input.conversation_id.clone(),
+        sender: Arc::from(sender),
+        message: Message::text(MessageRole::Assistant, content),
+        metadata: BTreeMap::new(),
+    }
+}
+
+fn is_clear_command(content: &str) -> bool {
+    let trimmed = content.trim();
+    if trimmed.eq_ignore_ascii_case("clear") {
+        return true;
+    }
+    let Some(first_token) = trimmed.split_whitespace().next() else {
+        return false;
+    };
+    let command = first_token.split('@').next().unwrap_or(first_token);
+    command.eq_ignore_ascii_case("/clear")
+}
+
+fn user_facing_error_message(error: &str) -> String {
+    if error.contains("insufficient_quota") {
+        let mut message = "AgentOS reached OpenAI, but OpenAI returned insufficient_quota for the configured API project or organization. Check OpenAI Platform billing, project budget, org usage limits, and prepaid API credits.".to_owned();
+        if let Some(request_id) = extract_openai_request_id(error) {
+            message.push_str("\nOpenAI request id: ");
+            message.push_str(&request_id);
+        }
+        return message;
+    }
+
+    let mut message =
+        "AgentOS could not complete this request. See the gateway log for details.".to_owned();
+    if let Some(request_id) = extract_openai_request_id(error) {
+        message.push_str("\nOpenAI request id: ");
+        message.push_str(&request_id);
+    }
+    message
+}
+
+fn extract_openai_request_id(error: &str) -> Option<String> {
+    let (_, rest) = error.split_once("x-request-id=")?;
+    let request_id = rest
+        .split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
+        .next()?
+        .trim();
+    if request_id.is_empty() {
+        None
+    } else {
+        Some(request_id.to_owned())
+    }
+}
+
+fn ensure_parent_dir(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+    Ok(())
+}
+
+fn read_pid(path: &Path) -> Result<Option<u32>, String> {
+    Ok(read_pid_record(path)?.map(|record| record.pid))
+}
+
+fn read_pid_record(path: &Path) -> Result<Option<PidRecord>, String> {
+    match fs::read_to_string(path) {
+        Ok(contents) => {
+            let mut parts = contents.split_whitespace();
+            let Some(pid) = parts.next() else {
+                return Ok(None);
+            };
+            let pid = pid
+                .parse::<u32>()
+                .map_err(|err| format!("invalid pid in {}: {err}", path.display()))?;
+            Ok(Some(PidRecord {
+                pid,
+                owner_token: parts.next().map(ToOwned::to_owned),
+            }))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(format!("failed to read {}: {err}", path.display())),
+    }
+}
+
+fn write_pid_record(path: &Path, pid: u32, owner_token: Option<&str>) -> Result<(), String> {
+    let contents = match owner_token {
+        Some(owner_token) => format!("{pid} {owner_token}\n"),
+        None => format!("{pid}\n"),
+    };
+    fs::write(path, contents)
+        .map_err(|err| format!("failed to write pid file {}: {err}", path.display()))
+}
+
+fn wait_for_pid_ownership(config: &ServiceConfig) -> Result<(), String> {
+    for _ in 0..20 {
+        if pid_file_owned_by_current_process(config)? {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let owner = read_pid(&config.pid_path)?
+        .map(|pid| pid.to_string())
+        .unwrap_or_else(|| "<missing>".to_owned());
+    Err(format!(
+        "pid file {} is not owned by this gateway process {}; owner={owner}",
+        config.pid_path.display(),
+        process::id()
+    ))
+}
+
+fn pid_file_owned_by_current_process(config: &ServiceConfig) -> Result<bool, String> {
+    let Some(record) = read_pid_record(&config.pid_path)? else {
+        return Ok(false);
+    };
+    if let Ok(owner_token) = env::var(OWNER_TOKEN_ENV) {
+        let token_matches =
+            !owner_token.is_empty() && record.owner_token.as_deref() == Some(&owner_token);
+        return Ok(token_matches || record.pid == process::id());
+    }
+    Ok(record.pid == process::id())
+}
+
+fn gateway_owner_token() -> Result<String, String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("failed to generate gateway owner token: {err}"))?
+        .as_nanos();
+    Ok(format!("{}-{now}", process::id()))
+}
+
+fn process_is_running(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn send_signal(pid: u32, signal: &str) -> Result<(), String> {
+    let status = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .status()
+        .map_err(|err| format!("failed to invoke kill: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("failed to send {signal} to pid {pid}"))
+    }
+}
+
+fn log_line(config: &ServiceConfig, message: &str) -> Result<(), String> {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("system time error: {err}"))?
+        .as_secs();
+    let line = format!("[{ts}] {message}\n");
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&config.log_path)
+        .and_then(|mut file| {
+            use std::io::Write;
+            file.write_all(line.as_bytes())
+        })
+        .map_err(|err| format!("failed to write log {}: {err}", config.log_path.display()))
+}
+
+fn display_optional_path(path: &Option<PathBuf>) -> String {
+    path.as_ref()
+        .map_or_else(|| "<unset>".to_owned(), |path| path.display().to_string())
+}
+
