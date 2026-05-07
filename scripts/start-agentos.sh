@@ -257,16 +257,16 @@ case "$mode" in
     exec "$gateway_bin" status --pid-path "$gateway_pid_path" --log-path "$gateway_log_path" --config "$AGENTOS_AGENT_CONFIG_PATH" --session-db-path "$AGENTOS_SESSION_DB_PATH"
     ;;
   tui)
-    exec "$cli_bin" "${cli_args[@]}"
+    exec "$cli_bin" ${cli_args[@]+"${cli_args[@]}"}
     ;;
   telegram-once|telegram-cron-smoke|feishu-once|feishu-cron-smoke)
-    exec "$cli_bin" "$mode" "${cli_args[@]}"
+    exec "$cli_bin" "$mode" ${cli_args[@]+"${cli_args[@]}"}
     ;;
   resume)
     if [[ "$resume_decision" == "reject" && -n "$resume_reason" ]]; then
-      exec "$cli_bin" resume "$resume_path" reject "$resume_reason" "${cli_args[@]}"
+      exec "$cli_bin" resume "$resume_path" reject "$resume_reason" ${cli_args[@]+"${cli_args[@]}"}
     fi
-    exec "$cli_bin" resume "$resume_path" "$resume_decision" "${cli_args[@]}"
+    exec "$cli_bin" resume "$resume_path" "$resume_decision" ${cli_args[@]+"${cli_args[@]}"}
     ;;
   *)
     echo "unknown command: $mode" >&2

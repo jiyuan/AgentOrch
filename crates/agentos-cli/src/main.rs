@@ -1,7 +1,9 @@
 use agentos_core::channels::{feishu::FeishuChannel, telegram::TelegramChannel};
 use agentos_core::crons::{CronSchedule, CronStore, CronTask};
 use agentos_core::gateway::{GatewayRun, GatewayService};
-use agentos_core::memory::SqliteStore;
+use agentos_core::memory::{
+    HydrationRequest, MemoryCaller, MemoryManager, MemoryStore, RetrievalStrategy, SqliteStore,
+};
 use agentos_core::runner::{
     delete_paused_run, load_paused_run, save_paused_run, ResumeDecision, RunnerDeps,
 };
@@ -15,7 +17,7 @@ use agentos_llm::{
     LlmSelection,
 };
 use agentos_proto::{
-    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, SpanKind,
+    AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, RunId, SpanKind, TaskId,
 };
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -109,12 +111,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(orchestrator_switch),
         Some(model_controller),
     );
+    let cron_store = CronStore::new(cron_dir_path());
+    let memory_manager = runtime.memory_manager.clone();
+    let resources = TuiResources {
+        skill_catalog: &runtime.skill_catalog,
+        cron_store: &cron_store,
+        memory_manager: memory_manager.as_ref(),
+    };
     run_tui_loop(
         &mut channel,
         &state_path,
         &deps,
         &active_agent,
         runtime.session.as_ref(),
+        &resources,
     )
     .await?;
     Ok(())
@@ -394,12 +404,19 @@ where
     Ok(())
 }
 
+struct TuiResources<'a> {
+    skill_catalog: &'a WorkspaceSkillCatalog,
+    cron_store: &'a CronStore,
+    memory_manager: &'a MemoryManager,
+}
+
 async fn run_tui_loop(
     channel: &mut TuiChannel,
     state_path: &Path,
     deps: &RunnerDeps<'_>,
     active_agent: &AgentId,
     session: &SqliteStore,
+    resources: &TuiResources<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let gateway_service = GatewayService::new(deps, Arc::from(active_agent.as_str()));
     let mut turn = 1_u64;
@@ -443,6 +460,31 @@ async fn run_tui_loop(
             }
             Some(TuiInput::ShowModel) => {
                 println!("{}", channel.model_status());
+                continue;
+            }
+            Some(TuiInput::ListSkills) => {
+                print_skills(resources.skill_catalog);
+                continue;
+            }
+            Some(TuiInput::ListCrons) => {
+                print_crons(resources.cron_store);
+                continue;
+            }
+            Some(TuiInput::ListTools) => {
+                print_tools(deps.tools);
+                continue;
+            }
+            Some(TuiInput::ListMemory) => {
+                print_memory(
+                    resources.memory_manager,
+                    active_agent,
+                    &channel.conversation_id,
+                )
+                .await;
+                continue;
+            }
+            Some(TuiInput::ShowHelp) => {
+                print_help();
                 continue;
             }
             None => return Ok(()),
@@ -696,6 +738,277 @@ fn unix_now() -> Result<u64, Box<dyn std::error::Error>> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
 }
 
+fn print_crons(store: &CronStore) {
+    let scheduler = match store.load_scheduler() {
+        Ok(scheduler) => scheduler,
+        Err(err) => {
+            println!(
+                "Failed to load cron schedule from {}: {err}",
+                store.root().display()
+            );
+            return;
+        }
+    };
+    let tasks = scheduler.tasks();
+    if tasks.is_empty() {
+        println!("No scheduled cron tasks in {}.", store.root().display());
+        println!("Define tasks under <id>.toml in that directory.");
+        return;
+    }
+
+    let now = unix_now().unwrap_or(0);
+    let id_width = tasks.iter().map(|task| task.id.len()).max().unwrap_or(0);
+    println!("Scheduled crons ({}):", tasks.len());
+    for task in tasks {
+        let interval = format_duration_seconds(task.schedule.interval_seconds);
+        let next_unix = task
+            .retry_state
+            .next_retry_unix
+            .unwrap_or(task.schedule.next_due_unix);
+        let when = if next_unix <= now {
+            "due now".to_owned()
+        } else {
+            format!("in {}", format_duration_seconds(next_unix - now))
+        };
+        let status = if !task.enabled {
+            "disabled"
+        } else if task.retry_state.consecutive_failures > 0 {
+            "retrying"
+        } else {
+            "enabled"
+        };
+        println!(
+            "  {:<width$}  every {}, next {}, {}",
+            task.id.as_ref(),
+            interval,
+            when,
+            status,
+            width = id_width,
+        );
+        println!(
+            "  {:<width$}    channel: {}, conversation: {}, prompt: {}",
+            "",
+            task.channel_id.as_str(),
+            task.conversation_id.as_str(),
+            truncate(task.prompt.as_ref(), 80),
+            width = id_width,
+        );
+        if task.retry_state.consecutive_failures > 0 {
+            let last_error = task.retry_state.last_error.as_deref().unwrap_or("(none)");
+            println!(
+                "  {:<width$}    failures: {}/{}, last error: {}",
+                "",
+                task.retry_state.consecutive_failures,
+                task.retry.max_retries,
+                last_error,
+                width = id_width,
+            );
+        }
+    }
+}
+
+fn format_duration_seconds(seconds: u64) -> String {
+    if seconds == 0 {
+        return "0s".to_owned();
+    }
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    let mins = (seconds % 3_600) / 60;
+    let secs = seconds % 60;
+    let mut parts = Vec::new();
+    if days > 0 {
+        parts.push(format!("{days}d"));
+    }
+    if hours > 0 {
+        parts.push(format!("{hours}h"));
+    }
+    if mins > 0 {
+        parts.push(format!("{mins}m"));
+    }
+    if secs > 0 && parts.len() < 2 {
+        parts.push(format!("{secs}s"));
+    }
+    parts.join(" ")
+}
+
+fn truncate(input: &str, max: usize) -> String {
+    if input.chars().count() <= max {
+        return input.to_owned();
+    }
+    let mut out: String = input.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+fn print_help() {
+    let entries: &[(&str, &str)] = &[
+        ("/help", "Show this list of slash commands."),
+        ("/clear", "Clear the current TUI conversation history."),
+        (
+            "/orchestrator [max|min|status]",
+            "Show or set the orchestrator strategy.",
+        ),
+        (
+            "/model [provider:model|status|reset]",
+            "Show, override, or clear the LLM model.",
+        ),
+        (
+            "/skills [list|status]",
+            "List enabled legacy workspace skills.",
+        ),
+        ("/crons [list|status]", "List scheduled cron tasks."),
+        ("/tools [list|status]", "List registered tools."),
+        (
+            "/memory [list|status]",
+            "List memory records visible to this session.",
+        ),
+        ("/exit, /quit", "Leave the TUI (also: exit, quit)."),
+    ];
+    let name_width = entries
+        .iter()
+        .map(|(name, _)| name.chars().count())
+        .max()
+        .unwrap_or(0);
+    println!("Available slash commands:");
+    for (name, description) in entries {
+        println!("  {name:<name_width$}  {description}");
+    }
+    println!();
+    println!("Type any other text to send a message to the agent.");
+}
+
+async fn print_memory(
+    manager: &MemoryManager,
+    agent_id: &AgentId,
+    conversation_id: &ConversationId,
+) {
+    let caller = MemoryCaller {
+        agent_id: agent_id.clone(),
+        task_id: TaskId::new("main"),
+        conversation_id: conversation_id.clone(),
+        user_id: None,
+        allowed_shared_domains: Vec::new(),
+    };
+    let request = HydrationRequest {
+        query: Arc::from(""),
+        domain: None,
+        max_fragments: 100,
+        max_tokens: usize::MAX,
+        stores: vec![
+            MemoryStore::Working,
+            MemoryStore::Episodic,
+            MemoryStore::Semantic,
+            MemoryStore::Procedural,
+        ],
+        strategy: RetrievalStrategy::Recency,
+    };
+    let fragments = match manager.hydrate(&caller, request).await {
+        Ok(fragments) => fragments,
+        Err(err) => {
+            println!("Failed to query memory: {err}");
+            return;
+        }
+    };
+    if fragments.is_empty() {
+        println!("No memory records visible to this session.");
+        return;
+    }
+    println!("Memory records ({}):", fragments.len());
+    for fragment in &fragments {
+        let id = fragment
+            .id
+            .as_ref()
+            .map(|record_id| record_id.as_str())
+            .unwrap_or("(no id)");
+        let store = fragment
+            .metadata
+            .get("store")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let owner_kind = fragment
+            .metadata
+            .get("owner_kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let summary = fragment_summary(&fragment.body, 96);
+        println!(
+            "  {id}  store={store}, owner={owner_kind}, ns={}",
+            fragment.namespace.as_str()
+        );
+        println!("       {summary}");
+    }
+}
+
+fn fragment_summary(body: &serde_json::Value, max: usize) -> String {
+    if let Some(text) = body.get("summary").and_then(serde_json::Value::as_str) {
+        return truncate(text, max);
+    }
+    if let Some(text) = body.as_str() {
+        return truncate(text, max);
+    }
+    truncate(&body.to_string(), max)
+}
+
+fn print_tools(registry: Option<&agentos_core::tools::ToolRegistry>) {
+    let Some(registry) = registry else {
+        println!("No tool registry is wired into this run.");
+        return;
+    };
+    let mut specs = registry.specs();
+    if specs.is_empty() {
+        println!("No tools are registered.");
+        return;
+    }
+    specs.sort_by(|left, right| left.name.cmp(&right.name));
+    let name_width = specs.iter().map(|spec| spec.name.len()).max().unwrap_or(0);
+    println!("Registered tools ({}):", specs.len());
+    for spec in &specs {
+        let isolation = if spec.requires_isolation {
+            " [requires_isolation]"
+        } else {
+            ""
+        };
+        println!(
+            "  {:<width$}  {}{}",
+            spec.name.as_ref(),
+            spec.description.as_ref(),
+            isolation,
+            width = name_width,
+        );
+    }
+}
+
+fn print_skills(catalog: &WorkspaceSkillCatalog) {
+    if catalog.is_empty() {
+        println!("No legacy skills are enabled in this workspace.");
+        println!("Define skills under workspace/skills/<name>/SKILL.md and enable them via");
+        println!("`[resources.skills] enabled = [\"<name>\"]` in workspace/agent.toml.");
+        return;
+    }
+
+    let skills: Vec<_> = catalog.skills().collect();
+    println!("Legacy skills ({}):", skills.len());
+    let name_width = skills
+        .iter()
+        .map(|skill| skill.name.len())
+        .max()
+        .unwrap_or(0);
+    for skill in skills {
+        println!(
+            "  {:<width$}  {}",
+            skill.name.as_ref(),
+            skill.description.as_ref(),
+            width = name_width
+        );
+        println!(
+            "  {:<width$}  path: {}",
+            "",
+            skill.path.display(),
+            width = name_width
+        );
+    }
+}
+
 struct TuiChannel {
     id: ChannelId,
     conversation_id: ConversationId,
@@ -711,6 +1024,11 @@ enum TuiInput {
     SetModel(String),
     ResetModel,
     ShowModel,
+    ListSkills,
+    ListCrons,
+    ListTools,
+    ListMemory,
+    ShowHelp,
 }
 
 impl TuiChannel {
@@ -756,6 +1074,69 @@ impl TuiChannel {
                 return Some(TuiInput::ResetModel);
             }
             return Some(TuiInput::SetModel(model.to_owned()));
+        }
+        if input.eq_ignore_ascii_case("/skills") {
+            return Some(TuiInput::ListSkills);
+        }
+        if let Some(rest) = input.strip_prefix("/skills ") {
+            let arg = rest.trim();
+            if arg.is_empty()
+                || arg.eq_ignore_ascii_case("list")
+                || arg.eq_ignore_ascii_case("status")
+            {
+                return Some(TuiInput::ListSkills);
+            }
+            println!("Usage: /skills [list|status]");
+            return Some(TuiInput::ListSkills);
+        }
+        if input.eq_ignore_ascii_case("/crons") {
+            return Some(TuiInput::ListCrons);
+        }
+        if let Some(rest) = input.strip_prefix("/crons ") {
+            let arg = rest.trim();
+            if arg.is_empty()
+                || arg.eq_ignore_ascii_case("list")
+                || arg.eq_ignore_ascii_case("status")
+            {
+                return Some(TuiInput::ListCrons);
+            }
+            println!("Usage: /crons [list|status]");
+            return Some(TuiInput::ListCrons);
+        }
+        if input.eq_ignore_ascii_case("/tools") {
+            return Some(TuiInput::ListTools);
+        }
+        if let Some(rest) = input.strip_prefix("/tools ") {
+            let arg = rest.trim();
+            if arg.is_empty()
+                || arg.eq_ignore_ascii_case("list")
+                || arg.eq_ignore_ascii_case("status")
+            {
+                return Some(TuiInput::ListTools);
+            }
+            println!("Usage: /tools [list|status]");
+            return Some(TuiInput::ListTools);
+        }
+        if input.eq_ignore_ascii_case("/memory") {
+            return Some(TuiInput::ListMemory);
+        }
+        if let Some(rest) = input.strip_prefix("/memory ") {
+            let arg = rest.trim();
+            if arg.is_empty()
+                || arg.eq_ignore_ascii_case("list")
+                || arg.eq_ignore_ascii_case("status")
+            {
+                return Some(TuiInput::ListMemory);
+            }
+            println!("Usage: /memory [list|status]");
+            return Some(TuiInput::ListMemory);
+        }
+        if input.eq_ignore_ascii_case("/help") || input.eq_ignore_ascii_case("/?") {
+            return Some(TuiInput::ShowHelp);
+        }
+        if let Some(rest) = input.strip_prefix("/help ") {
+            let _ = rest.trim();
+            return Some(TuiInput::ShowHelp);
         }
         Some(TuiInput::Envelope(self.envelope(input)))
     }
