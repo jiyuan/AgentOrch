@@ -1,15 +1,14 @@
+use crate::http::shared_client;
 use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
 use agentos_proto::{ToolCall, ToolResult, ToolStatus};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, value::RawValue, Value};
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[derive(Default)]
 pub struct ShellTool;
@@ -186,140 +185,41 @@ impl Tool for HttpTool {
         if !parsed.method.eq_ignore_ascii_case("GET") {
             return Err(ToolError::Failed(Arc::from("http tool only supports GET")));
         }
-        if parsed.url.starts_with("https://") {
-            return fetch_https_with_curl(call, &parsed.url);
+        if !(parsed.url.starts_with("http://") || parsed.url.starts_with("https://")) {
+            return Err(ToolError::Failed(Arc::from(
+                "http tool requires an http:// or https:// URL",
+            )));
         }
 
-        let target = parse_http_url(&parsed.url)?;
         let start = Instant::now();
-        let mut stream = TcpStream::connect((target.host.as_str(), target.port))
+        let response = shared_client()
+            .get(&parsed.url)
+            .send()
+            .await
             .map_err(|err| ToolError::Failed(err.to_string().into()))?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
+        let status_code = response.status();
+        let body = response
+            .text()
+            .await
             .map_err(|err| ToolError::Failed(err.to_string().into()))?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(10)))
-            .map_err(|err| ToolError::Failed(err.to_string().into()))?;
-        let request = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: agentos-core/0.1\r\nConnection: close\r\n\r\n",
-            target.path, target.host
-        );
-        stream
-            .write_all(request.as_bytes())
-            .map_err(|err| ToolError::Failed(err.to_string().into()))?;
-        let mut response = String::new();
-        stream
-            .read_to_string(&mut response)
-            .map_err(|err| ToolError::Failed(err.to_string().into()))?;
-        let (status_line, body) = split_http_response(&response);
         let bytes_out = body.len() as u64;
         let mut metadata = result_metadata(elapsed_ms(start), bytes_out);
-        metadata.insert(Arc::from("status_line"), Value::String(status_line));
+        metadata.insert(
+            Arc::from("status_line"),
+            Value::String(format!(
+                "HTTP {} {}",
+                status_code.as_u16(),
+                status_code.canonical_reason().unwrap_or("")
+            )),
+        );
 
         Ok(ToolResult {
             call_id: call.id.clone(),
-            status: http_status(&metadata).map_or(ToolStatus::Succeeded, status_from_http_code),
+            status: status_from_http_code(status_code.as_u16()),
             content: Arc::from(body),
             metadata,
         })
     }
-}
-
-struct HttpTarget {
-    host: String,
-    port: u16,
-    path: String,
-}
-
-fn parse_http_url(url: &str) -> Result<HttpTarget, ToolError> {
-    let Some(rest) = url.strip_prefix("http://") else {
-        return Err(ToolError::Failed(Arc::from(
-            "http tool currently supports http:// URLs only",
-        )));
-    };
-    let (host_port, path) = rest.split_once('/').unwrap_or((rest, ""));
-    if host_port.is_empty() {
-        return Err(ToolError::Failed(Arc::from("http URL host is empty")));
-    }
-    let (host, port) = match host_port.rsplit_once(':') {
-        Some((host, port)) => {
-            let parsed_port = port
-                .parse::<u16>()
-                .map_err(|err| ToolError::Failed(err.to_string().into()))?;
-            (host.to_owned(), parsed_port)
-        }
-        None => (host_port.to_owned(), 80),
-    };
-
-    Ok(HttpTarget {
-        host,
-        port,
-        path: format!("/{path}"),
-    })
-}
-
-fn split_http_response(response: &str) -> (String, String) {
-    let status_line = response.lines().next().unwrap_or_default().to_owned();
-    let body = response
-        .split_once("\r\n\r\n")
-        .map_or_else(String::new, |(_, body)| body.to_owned());
-    (status_line, body)
-}
-
-fn fetch_https_with_curl(call: &ToolCall, url: &str) -> Result<ToolResult, ToolError> {
-    let start = Instant::now();
-    let output = Command::new("curl")
-        .args([
-            "--location",
-            "--silent",
-            "--show-error",
-            "--max-time",
-            "10",
-            "--write-out",
-            "\nagentos_http_status:%{http_code}",
-            url,
-        ])
-        .output()
-        .map_err(|err| ToolError::Failed(err.to_string().into()))?;
-
-    let mut content = String::from_utf8_lossy(&output.stdout).into_owned();
-    let split_status = content
-        .rsplit_once("\nagentos_http_status:")
-        .map(|(body, code)| (body.to_owned(), code.trim().parse::<u16>().ok()));
-    let http_code = if let Some((body, code)) = split_status {
-        content = body;
-        code
-    } else {
-        None
-    };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(ToolError::Failed(stderr.trim().to_owned().into()));
-    }
-
-    let bytes_out = content.len() as u64;
-    let mut metadata = result_metadata(elapsed_ms(start), bytes_out);
-    metadata.insert(
-        Arc::from("status_line"),
-        Value::String(http_code.map_or_else(
-            || "curl status unknown".to_owned(),
-            |code| format!("curl status {code}"),
-        )),
-    );
-
-    Ok(ToolResult {
-        call_id: call.id.clone(),
-        status: http_code.map_or(ToolStatus::Succeeded, status_from_http_code),
-        content: Arc::from(content),
-        metadata,
-    })
-}
-
-fn http_status(metadata: &BTreeMap<Arc<str>, Value>) -> Option<u16> {
-    let status_line = metadata.get("status_line")?.as_str()?;
-    status_line
-        .split_whitespace()
-        .find_map(|part| part.parse::<u16>().ok())
 }
 
 fn status_from_http_code(code: u16) -> ToolStatus {

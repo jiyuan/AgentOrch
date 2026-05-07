@@ -3,12 +3,12 @@ use super::hybrid::{
     SemanticIndex, SemanticSearchHit,
 };
 use super::{MemoryError, MemoryScope};
+use crate::http::shared_client;
 use agentos_interfaces::memory::Record;
 use agentos_proto::{Namespace, RecordId};
 use async_trait::async_trait;
+use reqwest::Method;
 use serde_json::{json, Value};
-use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,12 +37,16 @@ impl Default for QdrantSemanticConfig {
 
 pub struct QdrantSemanticIndex {
     config: QdrantSemanticConfig,
-    endpoint: HttpEndpoint,
+    base_url: String,
 }
 
 impl QdrantSemanticIndex {
     pub fn new(config: QdrantSemanticConfig) -> Result<Self, MemoryError> {
-        let endpoint = HttpEndpoint::parse(&config.url)?;
+        if !config.url.starts_with("http://") && !config.url.starts_with("https://") {
+            return Err(memory_backend_error(
+                "qdrant url must use http:// or https://",
+            ));
+        }
         if config.collection.trim().is_empty() {
             return Err(memory_backend_error(
                 "qdrant collection must not be empty when semantic memory is enabled",
@@ -53,7 +57,47 @@ impl QdrantSemanticIndex {
                 "qdrant vector_dimensions must be greater than 0",
             ));
         }
-        Ok(Self { config, endpoint })
+        let base_url = config.url.trim_end_matches('/').to_owned();
+        Ok(Self { config, base_url })
+    }
+
+    async fn request_json(
+        &self,
+        method: Method,
+        path: &str,
+        body: &Value,
+    ) -> Result<Value, MemoryError> {
+        let url = format!("{}{path}", self.base_url);
+        let payload = serde_json::to_vec(body).map_err(super::memory_json_error)?;
+        let mut request = shared_client()
+            .request(method, &url)
+            .timeout(Duration::from_millis(self.config.timeout_ms))
+            .header("Content-Type", "application/json")
+            .body(payload);
+        if let Some(api_key) = &self.config.api_key {
+            request = request.header("api-key", api_key.as_ref());
+        }
+        let response = request.send().await.map_err(|err| {
+            memory_backend_error(format!(
+                "failed to call qdrant '{}': {err}",
+                self.config.url
+            ))
+        })?;
+        let status = response.status();
+        let body = response.bytes().await.map_err(|err| {
+            memory_backend_error(format!("failed to read qdrant response: {err}"))
+        })?;
+        if !status.is_success() {
+            return Err(memory_backend_error(format!(
+                "qdrant request failed with HTTP {}: {}",
+                status.as_u16(),
+                String::from_utf8_lossy(&body)
+            )));
+        }
+        if body.is_empty() {
+            return Ok(json!({}));
+        }
+        serde_json::from_slice(&body).map_err(super::memory_json_error)
     }
 
     fn search_vector(&self, query: &str) -> Vec<f32> {
@@ -117,15 +161,15 @@ impl QdrantSemanticIndex {
 impl SemanticIndex for QdrantSemanticIndex {
     async fn upsert(&self, scope: &MemoryScope, record: &Record) -> Result<(), MemoryError> {
         let body = self.upsert_body(scope, record)?;
-        self.endpoint.request_json(
-            "PUT",
+        self.request_json(
+            Method::PUT,
             &format!(
                 "/collections/{}/points?wait=true",
                 percent_encode_path(&self.config.collection)
             ),
             &body,
-            &self.config,
-        )?;
+        )
+        .await?;
         Ok(())
     }
 
@@ -150,15 +194,16 @@ impl SemanticIndex for QdrantSemanticIndex {
             "limit": limit,
             "with_payload": true,
         });
-        let response = self.endpoint.request_json(
-            "POST",
-            &format!(
-                "/collections/{}/points/search",
-                percent_encode_path(&self.config.collection)
-            ),
-            &body,
-            &self.config,
-        )?;
+        let response = self
+            .request_json(
+                Method::POST,
+                &format!(
+                    "/collections/{}/points/search",
+                    percent_encode_path(&self.config.collection)
+                ),
+                &body,
+            )
+            .await?;
 
         let Some(results) = response.get("result").and_then(Value::as_array) else {
             return Ok(Vec::new());
@@ -190,124 +235,17 @@ impl SemanticIndex for QdrantSemanticIndex {
         let body = json!({
             "points": record_ids.iter().map(qdrant_point_id).collect::<Vec<_>>(),
         });
-        self.endpoint.request_json(
-            "POST",
+        self.request_json(
+            Method::POST,
             &format!(
                 "/collections/{}/points/delete?wait=true",
                 percent_encode_path(&self.config.collection)
             ),
             &body,
-            &self.config,
-        )?;
+        )
+        .await?;
         Ok(())
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct HttpEndpoint {
-    host: String,
-    port: u16,
-    base_path: String,
-}
-
-impl HttpEndpoint {
-    fn parse(input: &str) -> Result<Self, MemoryError> {
-        let without_scheme = input
-            .strip_prefix("http://")
-            .ok_or_else(|| memory_backend_error("qdrant url must use http://"))?;
-        if without_scheme.starts_with('/') || without_scheme.trim().is_empty() {
-            return Err(memory_backend_error("qdrant url is missing a host"));
-        }
-        let (authority, path) = without_scheme
-            .split_once('/')
-            .map(|(authority, path)| (authority, format!("/{path}")))
-            .unwrap_or((without_scheme, String::new()));
-        let (host, port) = authority
-            .rsplit_once(':')
-            .map(|(host, port)| {
-                let parsed_port = port
-                    .parse::<u16>()
-                    .map_err(|_| memory_backend_error("qdrant url has an invalid port"))?;
-                Ok((host.to_owned(), parsed_port))
-            })
-            .unwrap_or_else(|| Ok((authority.to_owned(), 80)))?;
-        if host.trim().is_empty() {
-            return Err(memory_backend_error("qdrant url is missing a host"));
-        }
-        Ok(Self {
-            host,
-            port,
-            base_path: path.trim_end_matches('/').to_owned(),
-        })
-    }
-
-    fn request_json(
-        &self,
-        method: &str,
-        path: &str,
-        body: &Value,
-        config: &QdrantSemanticConfig,
-    ) -> Result<Value, MemoryError> {
-        let body = serde_json::to_string(body).map_err(super::memory_json_error)?;
-        let timeout = Duration::from_millis(config.timeout_ms);
-        let mut stream = TcpStream::connect((self.host.as_str(), self.port)).map_err(|err| {
-            memory_backend_error(format!(
-                "failed to connect to qdrant '{}': {err}",
-                config.url
-            ))
-        })?;
-        stream.set_read_timeout(Some(timeout)).map_err(|err| {
-            memory_backend_error(format!("failed to set qdrant read timeout: {err}"))
-        })?;
-        stream.set_write_timeout(Some(timeout)).map_err(|err| {
-            memory_backend_error(format!("failed to set qdrant write timeout: {err}"))
-        })?;
-        let mut headers = format!(
-            "{method} {}{path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-            self.base_path,
-            self.host,
-            body.len()
-        );
-        if let Some(api_key) = &config.api_key {
-            headers.push_str("api-key: ");
-            headers.push_str(api_key);
-            headers.push_str("\r\n");
-        }
-        headers.push_str("\r\n");
-        stream
-            .write_all(headers.as_bytes())
-            .and_then(|_| stream.write_all(body.as_bytes()))
-            .map_err(|err| {
-                memory_backend_error(format!("failed to write qdrant request: {err}"))
-            })?;
-
-        let mut response = String::new();
-        stream.read_to_string(&mut response).map_err(|err| {
-            memory_backend_error(format!("failed to read qdrant response: {err}"))
-        })?;
-        parse_http_json_response(&response)
-    }
-}
-
-fn parse_http_json_response(response: &str) -> Result<Value, MemoryError> {
-    let (headers, body) = response
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| memory_backend_error("qdrant returned a malformed HTTP response"))?;
-    let status = headers
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| memory_backend_error("qdrant returned a malformed HTTP status"))?;
-    if !(200..300).contains(&status) {
-        return Err(memory_backend_error(format!(
-            "qdrant request failed with HTTP {status}: {body}"
-        )));
-    }
-    if body.trim().is_empty() {
-        return Ok(json!({}));
-    }
-    serde_json::from_str(body).map_err(super::memory_json_error)
 }
 
 fn percent_encode_path(input: &str) -> String {

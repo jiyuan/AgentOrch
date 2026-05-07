@@ -5,9 +5,19 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Enables `agentos_interfaces::test_support`: deterministic Mock* impls for every
+# public trait. On by default in `cfg(test)`; downstream crates opt in with
+# `agentos-interfaces = { workspace = true, features = ["test-support"] }`.
+test-support = []
+
 [dependencies]
 agentos-proto.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

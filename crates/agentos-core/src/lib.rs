@@ -10,6 +10,7 @@ pub mod crons;
 pub mod gateway;
 pub mod guardrails;
 pub mod hooks;
+pub(crate) mod http;
 pub mod r#loop;
 pub mod memory;
 pub mod orchestrator;
