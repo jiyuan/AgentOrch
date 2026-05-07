@@ -212,10 +212,10 @@ impl FeishuChannel {
         })
     }
 
-    fn long_connection(&mut self) -> Result<&mut FeishuLongConnection, ChannelError> {
+    async fn long_connection(&mut self) -> Result<&mut FeishuLongConnection, ChannelError> {
         if self.long_connection.is_none() {
             let endpoint = self.websocket_endpoint()?;
-            self.long_connection = Some(FeishuLongConnection::connect(&endpoint)?);
+            self.long_connection = Some(FeishuLongConnection::connect(&endpoint).await?);
         }
         Ok(self
             .long_connection
@@ -235,15 +235,15 @@ impl FeishuChannel {
         )
     }
 
-    fn receive_long_connection(&mut self) -> Result<Option<Envelope>, ChannelError> {
+    async fn receive_long_connection(&mut self) -> Result<Option<Envelope>, ChannelError> {
         let channel_id = self.id.clone();
         let allowed_source_ids = self.allowed_source_ids.clone();
         let log_receive_errors = self.log_receive_errors;
-        match self.long_connection()?.receive_next_event(
-            &channel_id,
-            &allowed_source_ids,
-            log_receive_errors,
-        ) {
+        let connection = self.long_connection().await?;
+        match connection
+            .receive_next_event(&channel_id, &allowed_source_ids, log_receive_errors)
+            .await
+        {
             Ok(envelope) => Ok(envelope),
             Err(err) => {
                 self.long_connection = None;
@@ -260,7 +260,7 @@ impl Channel for FeishuChannel {
     }
 
     async fn receive(&mut self) -> Option<Envelope> {
-        match self.receive_long_connection() {
+        match self.receive_long_connection().await {
             Ok(envelope) => envelope,
             Err(err) => {
                 if self.log_receive_errors {

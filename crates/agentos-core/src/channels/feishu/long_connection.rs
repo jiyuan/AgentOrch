@@ -19,26 +19,28 @@ pub(super) struct FeishuLongConnection {
 }
 
 impl FeishuLongConnection {
-    pub(super) fn connect(endpoint: &FeishuEndpoint) -> Result<Self, ChannelError> {
+    pub(super) async fn connect(endpoint: &FeishuEndpoint) -> Result<Self, ChannelError> {
         Ok(Self {
-            socket: WebSocketConnection::connect(&endpoint.url)?,
+            socket: WebSocketConnection::connect(&endpoint.url).await?,
             fragments: HashMap::new(),
         })
     }
 
-    pub(super) fn receive_next_event(
+    pub(super) async fn receive_next_event(
         &mut self,
         channel_id: &ChannelId,
         allowed_source_ids: &[Arc<str>],
         log_receive_errors: bool,
     ) -> Result<Option<Envelope>, ChannelError> {
         loop {
-            let payload = self.socket.read_frame()?;
+            let payload = self.socket.read_frame().await?;
             let frame = FeishuFrame::decode(&payload)
                 .map_err(|err| ChannelError::Backend(Arc::from(err)))?;
             if frame.method == 0 {
                 if header_value(&frame.headers, "type") == Some("ping") {
-                    self.socket.write_frame(&pong_frame(&frame).encode())?;
+                    self.socket
+                        .write_frame(&pong_frame(&frame).encode())
+                        .await?;
                 }
                 continue;
             }
@@ -62,7 +64,7 @@ impl FeishuLongConnection {
                     )))
                 })?;
             let started = Instant::now();
-            self.ack_event(&frame, started)?;
+            self.ack_event(&frame, started).await?;
             if let Some(envelope) = envelope_from_event(&payload, channel_id, allowed_source_ids) {
                 return Ok(Some(envelope));
             }
@@ -74,9 +76,13 @@ impl FeishuLongConnection {
         }
     }
 
-    fn ack_event(&mut self, frame: &FeishuFrame, started: Instant) -> Result<(), ChannelError> {
+    async fn ack_event(
+        &mut self,
+        frame: &FeishuFrame,
+        started: Instant,
+    ) -> Result<(), ChannelError> {
         let ack = success_frame(frame, started.elapsed().as_millis() as u64);
-        self.socket.write_frame(&ack.encode())
+        self.socket.write_frame(&ack.encode()).await
     }
 
     fn event_payload(&mut self, frame: &FeishuFrame) -> Result<Option<Vec<u8>>, ChannelError> {

@@ -1,339 +1,296 @@
-use agentos_interfaces::ChannelError;
-use std::env;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+//! Async TLS WebSocket transport for the Feishu long-connection channel.
+//!
+//! Uses `tokio-tungstenite` with `rustls-tls-webpki-roots` so cert validation
+//! works without a system trust store (i.e. inside `distroless` / scratch
+//! containers). Replaces the earlier `openssl s_client` subprocess and its
+//! hand-rolled HTTP/1.1 upgrade.
+//!
+//! `HTTPS_PROXY` / `https_proxy` are honored for `http://`-scheme proxies via
+//! HTTP CONNECT tunneling. Other schemes (`https://`, `socks5://`) are not
+//! supported in the rustls path; the transport logs a warning and connects
+//! directly so users see their proxy is being ignored instead of silently
+//! failing closed.
 
-/// Maximum number of bytes drained from `openssl s_client`'s stderr when a
-/// failure occurs. Capped so a chatty subprocess can't balloon error messages.
-const STDERR_CAPTURE_LIMIT: u64 = 4 * 1024;
+use agentos_interfaces::ChannelError;
+use futures_util::{SinkExt, StreamExt};
+use std::env;
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::Request;
+use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::{client_async_tls, connect_async, MaybeTlsStream, WebSocketStream};
+use tracing::warn;
+
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 pub(super) struct WebSocketConnection {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
-    stderr: Option<ChildStderr>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ParsedWsUrl {
-    host: String,
-    port: u16,
-    path_and_query: String,
+    stream: WsStream,
 }
 
 impl WebSocketConnection {
-    pub(super) fn connect(url: &str) -> Result<Self, ChannelError> {
-        let parsed =
-            ParsedWsUrl::parse(url).map_err(|err| ChannelError::Backend(Arc::from(err)))?;
-        let proxy = https_proxy_for_openssl(&parsed.host);
-        let mut command = Command::new("openssl");
-        command
-            .arg("s_client")
-            .arg("-quiet")
-            .arg("-connect")
-            .arg(format!("{}:{}", parsed.host, parsed.port))
-            .arg("-servername")
-            .arg(&parsed.host)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // Pipe stderr so handshake / TLS / DNS errors surface in the
-            // returned ChannelError instead of disappearing into /dev/null.
-            .stderr(Stdio::piped());
-        if let Some(proxy) = &proxy {
-            command.arg("-proxy").arg(proxy);
-        }
-        let mut child = command
-            .spawn()
-            .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
-        let mut stderr = child.stderr.take();
-        let mut stdin = match child.stdin.take() {
-            Some(stdin) => stdin,
-            None => {
-                return Err(finalize_failure(
-                    &mut child,
-                    stderr.take(),
-                    "openssl stdin unavailable".to_owned(),
-                ))
-            }
-        };
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                return Err(finalize_failure(
-                    &mut child,
-                    stderr.take(),
-                    "openssl stdout unavailable".to_owned(),
-                ))
-            }
-        };
-        let mut stdout = BufReader::new(stdout);
-        let key = websocket_key()?;
-        if let Err(err) = write!(
-            stdin,
-            "GET {} HTTP/1.1\r\nHost: {}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\n\r\n",
-            parsed.path_and_query, parsed.host, key
-        ) {
-            return Err(finalize_failure(
-                &mut child,
-                stderr.take(),
-                format!("failed to write Feishu WebSocket upgrade request: {err}"),
-            ));
-        }
-        if let Err(err) = stdin.flush() {
-            return Err(finalize_failure(
-                &mut child,
-                stderr.take(),
-                format!("failed to flush Feishu WebSocket upgrade request: {err}"),
-            ));
-        }
+    pub(super) async fn connect(url: &str) -> Result<Self, ChannelError> {
+        let target = TargetUrl::parse(url)?;
+        let proxy = https_proxy_for_target(&target.host);
 
-        let mut status = String::new();
-        if let Err(err) = stdout.read_line(&mut status) {
-            return Err(finalize_failure(
-                &mut child,
-                stderr.take(),
-                format!("failed to read Feishu WebSocket upgrade response: {err}"),
-            ));
-        }
-        if !status.contains(" 101 ") {
-            return Err(finalize_failure(
-                &mut child,
-                stderr.take(),
-                format!("Feishu WebSocket upgrade failed: {}", status.trim()),
-            ));
-        }
+        let stream = match proxy {
+            Some(proxy) => connect_via_proxy(&proxy, &target).await?,
+            None => connect_direct(url).await?,
+        };
+
+        Ok(Self { stream })
+    }
+
+    pub(super) async fn read_frame(&mut self) -> Result<Vec<u8>, ChannelError> {
         loop {
-            let mut line = String::new();
-            if let Err(err) = stdout.read_line(&mut line) {
-                return Err(finalize_failure(
-                    &mut child,
-                    stderr.take(),
-                    format!("failed to read Feishu WebSocket upgrade headers: {err}"),
-                ));
-            }
-            if line == "\r\n" || line == "\n" || line.is_empty() {
-                break;
-            }
-        }
-
-        Ok(Self {
-            child,
-            stdin,
-            stdout,
-            stderr,
-        })
-    }
-
-    /// Convert a post-connect failure into a [`ChannelError`], killing the
-    /// openssl subprocess and appending whatever it last wrote to stderr.
-    fn fail(&mut self, primary: String) -> ChannelError {
-        finalize_failure(&mut self.child, self.stderr.take(), primary)
-    }
-
-    pub(super) fn read_frame(&mut self) -> Result<Vec<u8>, ChannelError> {
-        loop {
-            let mut header = [0_u8; 2];
-            if let Err(err) = self.stdout.read_exact(&mut header) {
-                return Err(self.fail(format!("Feishu WebSocket read header failed: {err}")));
-            }
-            let opcode = header[0] & 0x0f;
-            let masked = header[1] & 0x80 != 0;
-            let mut len = u64::from(header[1] & 0x7f);
-            if len == 126 {
-                let mut bytes = [0_u8; 2];
-                if let Err(err) = self.stdout.read_exact(&mut bytes) {
-                    return Err(self.fail(format!("Feishu WebSocket read length-16 failed: {err}")));
+            match self.stream.next().await {
+                Some(Ok(Message::Binary(payload))) => return Ok(payload.to_vec()),
+                Some(Ok(Message::Text(text))) => return Ok(text.as_bytes().to_vec()),
+                Some(Ok(Message::Ping(payload))) => {
+                    if let Err(err) = self.stream.send(Message::Pong(payload)).await {
+                        return Err(ChannelError::Backend(Arc::from(format!(
+                            "Feishu WebSocket pong send failed: {err}"
+                        ))));
+                    }
                 }
-                len = u64::from(u16::from_be_bytes(bytes));
-            } else if len == 127 {
-                let mut bytes = [0_u8; 8];
-                if let Err(err) = self.stdout.read_exact(&mut bytes) {
-                    return Err(self.fail(format!("Feishu WebSocket read length-64 failed: {err}")));
+                Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {}
+                Some(Ok(Message::Close(_))) => {
+                    return Err(ChannelError::Backend(Arc::from(
+                        "Feishu WebSocket closed by server",
+                    )));
                 }
-                len = u64::from_be_bytes(bytes);
-            }
-            let mask = if masked {
-                let mut mask = [0_u8; 4];
-                if let Err(err) = self.stdout.read_exact(&mut mask) {
-                    return Err(self.fail(format!("Feishu WebSocket read mask failed: {err}")));
+                Some(Err(err)) => {
+                    return Err(ChannelError::Backend(Arc::from(format!(
+                        "Feishu WebSocket read failed: {err}"
+                    ))));
                 }
-                Some(mask)
-            } else {
-                None
-            };
-            if len > 16 * 1024 * 1024 {
-                return Err(self.fail("Feishu WebSocket frame is too large".to_owned()));
-            }
-            let mut payload = vec![0_u8; len as usize];
-            if let Err(err) = self.stdout.read_exact(&mut payload) {
-                return Err(self.fail(format!("Feishu WebSocket read payload failed: {err}")));
-            }
-            if let Some(mask) = mask {
-                for (index, byte) in payload.iter_mut().enumerate() {
-                    *byte ^= mask[index % 4];
+                None => {
+                    return Err(ChannelError::Backend(Arc::from(
+                        "Feishu WebSocket stream ended",
+                    )));
                 }
-            }
-            match opcode {
-                0x2 => return Ok(payload),
-                0x8 => {
-                    return Err(self.fail("Feishu WebSocket closed by server".to_owned()));
-                }
-                0x9 => {
-                    self.write_control_frame(0x0a, &payload)?;
-                }
-                0x0a => {}
-                _ => {}
             }
         }
     }
 
-    pub(super) fn write_frame(&mut self, payload: &[u8]) -> Result<(), ChannelError> {
-        self.write_ws_frame(0x2, payload)
-    }
-
-    fn write_control_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), ChannelError> {
-        self.write_ws_frame(opcode, payload)
-    }
-
-    fn write_ws_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), ChannelError> {
-        let mut frame = Vec::new();
-        frame.push(0x80 | opcode);
-        let mask_key = websocket_mask()?;
-        if payload.len() < 126 {
-            frame.push(0x80 | payload.len() as u8);
-        } else if payload.len() <= u16::MAX as usize {
-            frame.push(0x80 | 126);
-            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        } else {
-            frame.push(0x80 | 127);
-            frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
-        }
-        frame.extend_from_slice(&mask_key);
-        for (index, byte) in payload.iter().enumerate() {
-            frame.push(byte ^ mask_key[index % 4]);
-        }
-        if let Err(err) = self
-            .stdin
-            .write_all(&frame)
-            .and_then(|_| self.stdin.flush())
-        {
-            return Err(self.fail(format!("Feishu WebSocket write failed: {err}")));
-        }
-        Ok(())
+    pub(super) async fn write_frame(&mut self, payload: &[u8]) -> Result<(), ChannelError> {
+        self.stream
+            .send(Message::Binary(payload.to_vec()))
+            .await
+            .map_err(|err| {
+                ChannelError::Backend(Arc::from(format!("Feishu WebSocket write failed: {err}")))
+            })
     }
 }
 
-/// Kill the openssl subprocess, drain whatever it last wrote to stderr (capped
-/// at [`STDERR_CAPTURE_LIMIT`] bytes), and fold that text into the returned
-/// error so operators see the actual TLS / DNS / cert failure instead of a
-/// bare upgrade message.
-fn finalize_failure(
-    child: &mut Child,
-    stderr: Option<ChildStderr>,
-    primary: String,
-) -> ChannelError {
-    let _ = child.kill();
-    let _ = child.wait();
-    let captured = drain_stderr(stderr);
-    let message = if captured.is_empty() {
-        primary
-    } else {
-        format!("{primary}\nopenssl stderr: {captured}")
-    };
-    ChannelError::Backend(Arc::from(message))
+async fn connect_direct(url: &str) -> Result<WsStream, ChannelError> {
+    let request: Request<()> = url.into_client_request().map_err(|err| {
+        ChannelError::Backend(Arc::from(format!(
+            "Feishu WebSocket URL is not a valid request: {err}"
+        )))
+    })?;
+    let (stream, _response) = connect_async(request).await.map_err(|err| {
+        ChannelError::Backend(Arc::from(format!(
+            "Feishu WebSocket direct connect failed: {err}"
+        )))
+    })?;
+    Ok(stream)
 }
 
-fn drain_stderr(handle: Option<ChildStderr>) -> String {
-    let Some(handle) = handle else {
-        return String::new();
-    };
-    let mut buf = Vec::new();
-    let _ = handle.take(STDERR_CAPTURE_LIMIT).read_to_end(&mut buf);
-    String::from_utf8_lossy(&buf).trim().to_owned()
+async fn connect_via_proxy(proxy: &Proxy, target: &TargetUrl) -> Result<WsStream, ChannelError> {
+    let mut tcp = TcpStream::connect((proxy.host.as_str(), proxy.port))
+        .await
+        .map_err(|err| {
+            ChannelError::Backend(Arc::from(format!(
+                "Feishu proxy connect ({}:{}) failed: {err}",
+                proxy.host, proxy.port
+            )))
+        })?;
+
+    let connect_line = format!(
+        "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n",
+        host = target.host,
+        port = target.port,
+    );
+    tcp.write_all(connect_line.as_bytes())
+        .await
+        .map_err(|err| {
+            ChannelError::Backend(Arc::from(format!(
+                "Feishu proxy CONNECT write failed: {err}"
+            )))
+        })?;
+
+    let mut reader = BufReader::new(tcp);
+    let mut status = String::new();
+    reader.read_line(&mut status).await.map_err(|err| {
+        ChannelError::Backend(Arc::from(format!(
+            "Feishu proxy CONNECT response read failed: {err}"
+        )))
+    })?;
+    if !status.contains(" 200 ") {
+        return Err(ChannelError::Backend(Arc::from(format!(
+            "Feishu proxy CONNECT rejected: {}",
+            status.trim()
+        ))));
+    }
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).await.map_err(|err| {
+            ChannelError::Backend(Arc::from(format!(
+                "Feishu proxy CONNECT header read failed: {err}"
+            )))
+        })?;
+        if line == "\r\n" || line == "\n" || line.is_empty() {
+            break;
+        }
+    }
+    let tunneled = reader.into_inner();
+
+    let request: Request<()> =
+        target
+            .original_url
+            .as_str()
+            .into_client_request()
+            .map_err(|err| {
+                ChannelError::Backend(Arc::from(format!(
+                    "Feishu WebSocket URL is not a valid request: {err}"
+                )))
+            })?;
+    let (stream, _response) = client_async_tls(request, tunneled).await.map_err(|err| {
+        ChannelError::Backend(Arc::from(format!(
+            "Feishu WebSocket tunnelled handshake failed: {err}"
+        )))
+    })?;
+    Ok(stream)
 }
 
-impl ParsedWsUrl {
-    fn parse(input: &str) -> Result<Self, String> {
-        let rest = input
-            .strip_prefix("wss://")
-            .ok_or_else(|| "Feishu WebSocket URL must use wss://".to_owned())?;
-        let (authority, path) = rest
-            .split_once('/')
-            .map_or((rest, "/"), |(authority, path)| (authority, path));
-        let (host, port) = if let Some((host, port)) = authority.rsplit_once(':') {
-            (
-                host.to_owned(),
-                port.parse::<u16>()
-                    .map_err(|err| format!("invalid WebSocket port: {err}"))?,
-            )
-        } else {
-            (authority.to_owned(), 443)
+#[derive(Clone, Debug)]
+struct TargetUrl {
+    host: String,
+    port: u16,
+    original_url: String,
+}
+
+impl TargetUrl {
+    fn parse(url: &str) -> Result<Self, ChannelError> {
+        let rest = url.strip_prefix("wss://").ok_or_else(|| {
+            ChannelError::Backend(Arc::from("Feishu WebSocket URL must use wss://"))
+        })?;
+        let (authority, _path) = rest.split_once('/').unwrap_or((rest, ""));
+        if authority.is_empty() {
+            return Err(ChannelError::Backend(Arc::from(
+                "Feishu WebSocket URL is missing a host",
+            )));
+        }
+        let (host, port) = match authority.rsplit_once(':') {
+            Some((host, port)) => {
+                let parsed = port.parse::<u16>().map_err(|err| {
+                    ChannelError::Backend(Arc::from(format!("invalid WebSocket port: {err}")))
+                })?;
+                (host.to_owned(), parsed)
+            }
+            None => (authority.to_owned(), 443),
         };
-        if host.is_empty() {
-            return Err("Feishu WebSocket URL is missing a host".to_owned());
-        }
         Ok(Self {
             host,
             port,
-            path_and_query: format!("/{path}"),
+            original_url: url.to_owned(),
         })
     }
 }
 
-fn websocket_key() -> Result<String, ChannelError> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?
-        .as_nanos();
-    Ok(base64_encode(&now.to_be_bytes()))
+#[derive(Clone, Debug)]
+struct Proxy {
+    host: String,
+    port: u16,
 }
 
-fn websocket_mask() -> Result<[u8; 4], ChannelError> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?
-        .as_nanos();
-    let bytes = now.to_be_bytes();
-    Ok([bytes[12], bytes[13], bytes[14], bytes[15]])
-}
-
-fn base64_encode(input: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = String::new();
-    for chunk in input.chunks(3) {
-        let a = chunk[0];
-        let b = *chunk.get(1).unwrap_or(&0);
-        let c = *chunk.get(2).unwrap_or(&0);
-        output.push(TABLE[(a >> 2) as usize] as char);
-        output.push(TABLE[(((a & 0x03) << 4) | (b >> 4)) as usize] as char);
-        if chunk.len() > 1 {
-            output.push(TABLE[(((b & 0x0f) << 2) | (c >> 6)) as usize] as char);
-        } else {
-            output.push('=');
-        }
-        if chunk.len() > 2 {
-            output.push(TABLE[(c & 0x3f) as usize] as char);
-        } else {
-            output.push('=');
-        }
-    }
-    output
-}
-
-fn https_proxy_for_openssl(host: &str) -> Option<String> {
+/// Resolve the effective HTTP proxy for the Feishu long connection.
+///
+/// Reads `HTTPS_PROXY` / `https_proxy` (and `NO_PROXY` / `no_proxy`).
+/// `http://` and bare `host:port` values are accepted as HTTP CONNECT proxies;
+/// `https://`, `socks5://`, and `socks5h://` are not supported in the rustls
+/// path and produce a `tracing::warn!` instead of being silently dropped, so
+/// operators notice their configured proxy is being ignored.
+fn https_proxy_for_target(host: &str) -> Option<Proxy> {
     if no_proxy_matches(host) {
         return None;
     }
-    env::var("HTTPS_PROXY")
+    let raw = env::var("HTTPS_PROXY")
         .or_else(|_| env::var("https_proxy"))
-        .ok()
-        .and_then(|proxy| proxy.strip_prefix("http://").map(ToOwned::to_owned))
-        .and_then(|proxy| {
-            let proxy = proxy.trim_end_matches('/').to_owned();
-            (!proxy.is_empty()).then_some(proxy)
-        })
+        .ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let (scheme, body) = match trimmed.split_once("://") {
+        Some((scheme, body)) => (Some(scheme.to_ascii_lowercase()), body),
+        None => (None, trimmed),
+    };
+    match scheme.as_deref() {
+        None | Some("http") => parse_proxy_authority(body, &raw),
+        Some("https") => {
+            warn!(
+                proxy = %raw,
+                "https:// proxy schemes are not supported in the rustls Feishu transport; \
+                 connecting directly. Switch to an http:// proxy or unset HTTPS_PROXY."
+            );
+            None
+        }
+        Some("socks5") | Some("socks5h") | Some("socks4") | Some("socks4a") => {
+            warn!(
+                proxy = %raw,
+                "SOCKS proxies are not supported in the rustls Feishu transport; \
+                 connecting directly."
+            );
+            None
+        }
+        Some(other) => {
+            warn!(
+                proxy = %raw,
+                scheme = %other,
+                "unrecognised HTTPS_PROXY scheme; connecting directly."
+            );
+            None
+        }
+    }
+}
+
+fn parse_proxy_authority(body: &str, raw: &str) -> Option<Proxy> {
+    // Strip a userinfo prefix (`user:pass@…`) and a trailing path / query.
+    let after_userinfo = body.rsplit_once('@').map_or(body, |(_, host)| host);
+    let host_port = after_userinfo
+        .split('/')
+        .next()
+        .unwrap_or(after_userinfo)
+        .trim();
+    if host_port.is_empty() {
+        warn!(proxy = %raw, "HTTPS_PROXY contained no host; connecting directly.");
+        return None;
+    }
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((host, port)) => {
+            let parsed = match port.parse::<u16>() {
+                Ok(value) => value,
+                Err(_) => {
+                    warn!(
+                        proxy = %raw,
+                        "HTTPS_PROXY port is not a number; connecting directly."
+                    );
+                    return None;
+                }
+            };
+            (host.to_owned(), parsed)
+        }
+        None => (host_port.to_owned(), 80),
+    };
+    if host.is_empty() {
+        warn!(proxy = %raw, "HTTPS_PROXY host is empty; connecting directly.");
+        return None;
+    }
+    Some(Proxy { host, port })
 }
 
 fn no_proxy_matches(host: &str) -> bool {
@@ -355,4 +312,151 @@ fn no_proxy_entry_matches(host: &str, entry: &str) -> bool {
         || entry
             .strip_prefix('.')
             .is_some_and(|suffix| host.ends_with(suffix))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_env<F: FnOnce()>(values: &[(&str, Option<&str>)], body: F) {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved: Vec<(String, Option<String>)> = values
+            .iter()
+            .map(|(key, _)| ((*key).to_owned(), env::var(key).ok()))
+            .collect();
+        for (key, value) in values {
+            match value {
+                Some(v) => env::set_var(key, v),
+                None => env::remove_var(key),
+            }
+        }
+        body();
+        for (key, original) in saved {
+            match original {
+                Some(v) => env::set_var(&key, v),
+                None => env::remove_var(&key),
+            }
+        }
+    }
+
+    #[test]
+    fn target_url_parses_host_and_default_port() {
+        let parsed = TargetUrl::parse("wss://example.com/path?x=1").unwrap();
+        assert_eq!(parsed.host, "example.com");
+        assert_eq!(parsed.port, 443);
+    }
+
+    #[test]
+    fn target_url_parses_explicit_port() {
+        let parsed = TargetUrl::parse("wss://example.com:8443/").unwrap();
+        assert_eq!(parsed.port, 8443);
+    }
+
+    #[test]
+    fn target_url_rejects_non_wss() {
+        assert!(TargetUrl::parse("ws://example.com").is_err());
+    }
+
+    #[test]
+    fn proxy_accepts_http_scheme() {
+        with_env(
+            &[
+                ("HTTPS_PROXY", Some("http://corp:3128")),
+                ("https_proxy", None),
+                ("NO_PROXY", None),
+                ("no_proxy", None),
+            ],
+            || {
+                let proxy = https_proxy_for_target("example.com").unwrap();
+                assert_eq!(proxy.host, "corp");
+                assert_eq!(proxy.port, 3128);
+            },
+        );
+    }
+
+    #[test]
+    fn proxy_accepts_bare_host_port() {
+        with_env(
+            &[
+                ("HTTPS_PROXY", Some("corp:3128")),
+                ("https_proxy", None),
+                ("NO_PROXY", None),
+                ("no_proxy", None),
+            ],
+            || {
+                let proxy = https_proxy_for_target("example.com").unwrap();
+                assert_eq!(proxy.host, "corp");
+                assert_eq!(proxy.port, 3128);
+            },
+        );
+    }
+
+    #[test]
+    fn proxy_strips_userinfo() {
+        with_env(
+            &[
+                ("HTTPS_PROXY", Some("http://user:pass@corp:3128/")),
+                ("https_proxy", None),
+                ("NO_PROXY", None),
+                ("no_proxy", None),
+            ],
+            || {
+                let proxy = https_proxy_for_target("example.com").unwrap();
+                assert_eq!(proxy.host, "corp");
+                assert_eq!(proxy.port, 3128);
+            },
+        );
+    }
+
+    #[test]
+    fn proxy_rejects_https_scheme_with_warning() {
+        // We can't intercept tracing here; just verify the function returns
+        // None instead of silently treating https:// as a CONNECT proxy.
+        with_env(
+            &[
+                ("HTTPS_PROXY", Some("https://corp:3128")),
+                ("https_proxy", None),
+                ("NO_PROXY", None),
+                ("no_proxy", None),
+            ],
+            || {
+                assert!(https_proxy_for_target("example.com").is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn proxy_rejects_socks_scheme() {
+        with_env(
+            &[
+                ("HTTPS_PROXY", Some("socks5://corp:1080")),
+                ("https_proxy", None),
+                ("NO_PROXY", None),
+                ("no_proxy", None),
+            ],
+            || {
+                assert!(https_proxy_for_target("example.com").is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn proxy_honours_no_proxy() {
+        with_env(
+            &[
+                ("HTTPS_PROXY", Some("http://corp:3128")),
+                ("https_proxy", None),
+                ("NO_PROXY", Some("example.com,.internal")),
+                ("no_proxy", None),
+            ],
+            || {
+                assert!(https_proxy_for_target("example.com").is_none());
+                assert!(https_proxy_for_target("foo.internal").is_none());
+                assert!(https_proxy_for_target("other.com").is_some());
+            },
+        );
+    }
 }
