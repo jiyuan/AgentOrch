@@ -1,4 +1,7 @@
-use crate::providers::content::{append_descriptors, image_mime, read_base64};
+use crate::providers::content::{
+    append_descriptors, document_mime, format_text_document, image_mime, read_base64,
+    read_text_document,
+};
 use crate::providers::{first_env, format_openai_error, post_json};
 use agentos_proto::{Attachment, AttachmentKind, Message, MessageRole};
 use serde_json::{json, Value};
@@ -111,10 +114,7 @@ fn build_message(message: &Message) -> Value {
 fn content_block_for(attachment: &Attachment) -> Option<Value> {
     match attachment.kind {
         AttachmentKind::Image => image_block(attachment),
-        // OpenAI chat completions doesn't accept inline document payloads;
-        // fall back to a text descriptor so the model at least knows it
-        // exists and can call a filesystem tool to read it.
-        AttachmentKind::Document => None,
+        AttachmentKind::Document => document_block(attachment),
     }
 }
 
@@ -126,6 +126,34 @@ fn image_block(attachment: &Attachment) -> Option<Value> {
         "type": "image_url",
         "image_url": { "url": url }
     }))
+}
+
+/// Translate a document attachment into a Chat Completions content block.
+/// PDFs become a native `file` block; text-like documents (.txt, .md, .csv,
+/// source code, etc.) are read off disk and inlined as a fenced text block.
+/// Pure binary formats (.docx, .xlsx, .zip) return `None` and fall back to
+/// the text descriptor — Chat Completions has no generic binary shape.
+fn document_block(attachment: &Attachment) -> Option<Value> {
+    if let Some(media_type) = document_mime(attachment) {
+        if let Ok(data) = read_base64(&attachment.path) {
+            let file_data = format!("data:{media_type};base64,{data}");
+            return Some(json!({
+                "type": "file",
+                "file": {
+                    "filename": attachment.name.as_ref(),
+                    "file_data": file_data,
+                }
+            }));
+        }
+    }
+    if let Some(Ok(body)) = read_text_document(attachment) {
+        let formatted = format_text_document(&attachment.name, &body);
+        return Some(json!({
+            "type": "text",
+            "text": formatted,
+        }));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -206,15 +234,69 @@ mod tests {
     }
 
     #[test]
-    fn document_falls_back_to_descriptor() {
+    fn pdf_attachment_emits_file_block() {
+        let path = write_tmp("spec.pdf", b"%PDF-1.4 fake");
         let msg = Message {
             role: MessageRole::User,
             content: Arc::from("see attached"),
             attachments: vec![Attachment {
                 kind: AttachmentKind::Document,
                 name: Arc::from("spec.pdf"),
-                path: PathBuf::from("/tmp/spec.pdf"),
+                path,
                 mime: Some(Arc::from("application/pdf")),
+                size: Some(13),
+                source: None,
+            }],
+            metadata: Default::default(),
+        };
+        let value = build_message(&msg);
+        let blocks = value.get("content").and_then(Value::as_array).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["text"], "see attached");
+        assert_eq!(blocks[1]["type"], "file");
+        assert_eq!(blocks[1]["file"]["filename"], "spec.pdf");
+        let file_data = blocks[1]["file"]["file_data"].as_str().unwrap();
+        assert!(file_data.starts_with("data:application/pdf;base64,"));
+    }
+
+    #[test]
+    fn text_document_inlined_as_fenced_block() {
+        let path = write_tmp("notes.md", b"# heading\nbody text");
+        let msg = Message {
+            role: MessageRole::User,
+            content: Arc::from("summarize"),
+            attachments: vec![Attachment {
+                kind: AttachmentKind::Document,
+                name: Arc::from("notes.md"),
+                path,
+                mime: None,
+                size: Some(19),
+                source: None,
+            }],
+            metadata: Default::default(),
+        };
+        let value = build_message(&msg);
+        let blocks = value.get("content").and_then(Value::as_array).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["text"], "summarize");
+        assert_eq!(blocks[1]["type"], "text");
+        let inlined = blocks[1]["text"].as_str().unwrap();
+        assert!(inlined.starts_with("File: notes.md"));
+        assert!(inlined.contains("# heading"));
+    }
+
+    #[test]
+    fn non_pdf_binary_document_falls_back_to_descriptor() {
+        let msg = Message {
+            role: MessageRole::User,
+            content: Arc::from("see attached"),
+            attachments: vec![Attachment {
+                kind: AttachmentKind::Document,
+                name: Arc::from("notes.docx"),
+                path: PathBuf::from("/tmp/notes.docx"),
+                mime: Some(Arc::from(
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )),
                 size: Some(2048),
                 source: None,
             }],
@@ -225,8 +307,7 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0]["type"], "text");
         let text = blocks[0]["text"].as_str().unwrap();
-        assert!(text.starts_with("see attached"));
         assert!(text.contains("[attached document:"));
-        assert!(text.contains("spec.pdf"));
+        assert!(text.contains("notes.docx"));
     }
 }

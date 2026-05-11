@@ -1,4 +1,7 @@
-use crate::providers::content::{append_descriptors, document_mime, image_mime, read_base64};
+use crate::providers::content::{
+    append_descriptors, document_mime, format_text_document, image_mime, read_base64,
+    read_text_document,
+};
 use crate::providers::post_json;
 use agentos_proto::{Attachment, AttachmentKind, Message, MessageRole};
 use serde_json::{json, Value};
@@ -126,16 +129,26 @@ fn image_block(attachment: &Attachment) -> Option<Value> {
 }
 
 fn document_block(attachment: &Attachment) -> Option<Value> {
-    let media_type = document_mime(attachment)?;
-    let data = read_base64(&attachment.path).ok()?;
-    Some(json!({
-        "type": "document",
-        "source": {
-            "type": "base64",
-            "media_type": media_type,
-            "data": data,
+    if let Some(media_type) = document_mime(attachment) {
+        if let Ok(data) = read_base64(&attachment.path) {
+            return Some(json!({
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": data,
+                }
+            }));
         }
-    }))
+    }
+    if let Some(Ok(body)) = read_text_document(attachment) {
+        let formatted = format_text_document(&attachment.name, &body);
+        return Some(json!({
+            "type": "text",
+            "text": formatted,
+        }));
+    }
+    None
 }
 
 #[cfg(test)]
