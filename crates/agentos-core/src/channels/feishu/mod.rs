@@ -1,4 +1,5 @@
 use crate::channels::attachments::{file_size, AttachmentStore};
+use crate::channels::text::split_text;
 use agentos_interfaces::{Channel, ChannelError};
 use agentos_proto::{Attachment, AttachmentKind, ChannelId, Envelope};
 use async_trait::async_trait;
@@ -21,6 +22,12 @@ use event::{
 use long_connection::{FeishuEndpoint, FeishuLongConnection};
 
 const DEFAULT_API_BASE: &str = "https://open.feishu.cn/open-apis";
+
+/// Conservative per-message character cap for Feishu text messages. The raw
+/// API limit is ~30 KB, but UTF-8 multi-byte chars eat into that and bot
+/// clients render long bodies poorly — chunking at 4000 chars matches what
+/// users actually see in chat.
+const FEISHU_TEXT_LIMIT: usize = 4000;
 
 pub struct FeishuChannel {
     app_id: Arc<str>,
@@ -130,8 +137,11 @@ impl FeishuChannel {
     }
 
     fn send_text(&self, receive_id: &str, text: &str) -> Result<(), ChannelError> {
-        let content = json!({ "text": text }).to_string();
-        self.send_message(receive_id, "text", &content)
+        for chunk in split_text(text, FEISHU_TEXT_LIMIT) {
+            let content = json!({ "text": chunk }).to_string();
+            self.send_message(receive_id, "text", &content)?;
+        }
+        Ok(())
     }
 
     fn send_message(

@@ -1,4 +1,5 @@
 use crate::channels::attachments::{file_size, AttachmentStore};
+use crate::channels::text::split_text;
 use agentos_interfaces::{Channel, ChannelError};
 use agentos_proto::{
     Attachment, AttachmentKind, ChannelId, ConversationId, Envelope, Message, MessageRole,
@@ -144,6 +145,13 @@ impl TelegramChannel {
     }
 
     fn send_text(&self, chat_id: &str, text: &str) -> Result<(), ChannelError> {
+        for chunk in split_text(text, TELEGRAM_TEXT_LIMIT) {
+            self.send_text_chunk(chat_id, &chunk)?;
+        }
+        Ok(())
+    }
+
+    fn send_text_chunk(&self, chat_id: &str, text: &str) -> Result<(), ChannelError> {
         let text_arg = format!("text={text}");
         let chat_arg = format!("chat_id={chat_id}");
         let output = Command::new("curl")
@@ -238,8 +246,19 @@ impl Channel for TelegramChannel {
             return self.send_text(chat_id, &env.message.content);
         }
 
+        // Telegram captions are capped at 1024 chars. If the reply text is
+        // longer, send it as a separate message first and don't attach a
+        // caption — otherwise the multipart sendPhoto/sendDocument would 400.
         let text = env.message.content.as_ref();
-        let mut caption = if text.is_empty() { None } else { Some(text) };
+        let caption = if text.is_empty() {
+            None
+        } else if text.chars().count() <= TELEGRAM_CAPTION_LIMIT {
+            Some(text)
+        } else {
+            self.send_text(chat_id, text)?;
+            None
+        };
+        let mut caption = caption;
         for attachment in &env.message.attachments {
             self.send_attachment(chat_id, attachment, caption)?;
             caption = None;
@@ -247,6 +266,12 @@ impl Channel for TelegramChannel {
         Ok(())
     }
 }
+
+/// Telegram sendMessage hard limit: 4096 characters per message body.
+const TELEGRAM_TEXT_LIMIT: usize = 4096;
+
+/// Telegram sendPhoto/sendDocument caption hard limit: 1024 characters.
+const TELEGRAM_CAPTION_LIMIT: usize = 1024;
 
 fn check_send_response(
     status: &std::process::ExitStatus,
