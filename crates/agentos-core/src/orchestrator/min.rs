@@ -53,6 +53,11 @@ impl Orchestrator for MinOrchestrator {
             .iter()
             .map(|item| item.message.clone())
             .collect::<Vec<_>>();
+        eprintln!(
+            "MinOrchestrator::plan: messages={} tool_specs={}",
+            messages.len(),
+            self.tool_specs.len()
+        );
         let response = self
             .llm
             .complete_messages(&messages, &self.tool_specs)

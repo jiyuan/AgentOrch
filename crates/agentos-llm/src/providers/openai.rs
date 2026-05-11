@@ -39,6 +39,15 @@ pub async fn complete(
         // One call per turn — the loop iterates so we don't need parallelism.
         payload["parallel_tool_calls"] = json!(false);
     }
+    let tool_names = tools
+        .iter()
+        .map(|t| t.name.as_ref())
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!(
+        "openai: model={model} messages={} tools=[{tool_names}]",
+        messages.len()
+    );
     let response = post_json(
         "llm",
         &format!("{}/chat/completions", base_url.trim_end_matches('/')),

@@ -158,6 +158,11 @@ impl MaxOrchestrator {
                 .iter()
                 .map(|item| item.message.clone())
                 .collect::<Vec<_>>();
+            eprintln!(
+                "MaxOrchestrator::plan_with_llm fallback: messages={} available_tools={}",
+                messages.len(),
+                self.available_tools.len()
+            );
             let response = llm
                 .complete_messages(&messages, &self.available_tools)
                 .await
