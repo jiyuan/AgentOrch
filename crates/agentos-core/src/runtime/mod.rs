@@ -212,6 +212,7 @@ impl AgentRuntime {
             registry
                 .with_trace_sink(trace_sink.clone())
                 .with_task_workspace(task_workspace.clone())
+                .with_session(session.clone())
         });
 
         Ok(Self {

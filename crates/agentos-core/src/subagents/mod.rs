@@ -6,6 +6,7 @@ use crate::task_workspace::TaskWorkspace;
 use crate::tools::ToolRegistry;
 use agentos_interfaces::guardrail::{InputGuardrail, OutputGuardrail, ToolGuardrail};
 use agentos_interfaces::orchestrator::{Orchestrator, SubAgentSpec};
+use agentos_interfaces::session::Session;
 use agentos_proto::{AgentId, ChannelId, ConversationId, Envelope, Message, MessageRole, RunId};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -147,6 +148,7 @@ pub struct SubAgentInvocation {
     channel_capacity: usize,
     trace_sink: Option<Arc<dyn TraceSink>>,
     task_workspace: Option<Arc<TaskWorkspace>>,
+    session: Option<Arc<dyn Session>>,
 }
 
 pub struct SubAgentRegistry {
@@ -154,6 +156,7 @@ pub struct SubAgentRegistry {
     channel_capacity: usize,
     trace_sink: Option<Arc<dyn TraceSink>>,
     task_workspace: Option<Arc<TaskWorkspace>>,
+    session: Option<Arc<dyn Session>>,
 }
 
 impl Default for SubAgentRegistry {
@@ -169,6 +172,7 @@ impl SubAgentRegistry {
             channel_capacity: 1,
             trace_sink: None,
             task_workspace: None,
+            session: None,
         }
     }
 
@@ -184,6 +188,15 @@ impl SubAgentRegistry {
 
     pub fn with_task_workspace(mut self, task_workspace: Arc<TaskWorkspace>) -> Self {
         self.task_workspace = Some(task_workspace);
+        self
+    }
+
+    /// Inject a persistent `Session` shared with the parent runtime so
+    /// sub-agents accumulate their own transcript across turns. Without this,
+    /// each invocation runs against a fresh `InMemorySession` and loses
+    /// context as soon as the run returns.
+    pub fn with_session(mut self, session: Arc<dyn Session>) -> Self {
+        self.session = Some(session);
         self
     }
 
@@ -221,6 +234,7 @@ impl SubAgentRegistry {
             channel_capacity: self.channel_capacity,
             trace_sink: self.trace_sink.clone(),
             task_workspace: self.task_workspace.clone(),
+            session: self.session.clone(),
         })
     }
 }
@@ -240,12 +254,26 @@ impl SubAgentInvocation {
         let run_id = self.run_id;
         let trace_sink = self.trace_sink;
         let task_workspace = self.task_workspace;
+        let injected_session = self.session;
         let local = LocalSet::new();
         let handle = local.spawn_local(async move {
             let Some(input) = input_rx.recv().await else {
                 return Err(SubAgentError::ChannelClosed);
             };
-            let session = InMemorySession::default();
+            // Prefer the runtime-injected session (persistent, shared with the
+            // parent) so sub-agents accumulate context across turns. Fall back
+            // to an ephemeral in-memory session for callers that didn't wire
+            // one in (tests, embedded uses).
+            let fallback_session = if injected_session.is_none() {
+                Some(InMemorySession::default())
+            } else {
+                None
+            };
+            let session: &dyn Session = match (&injected_session, &fallback_session) {
+                (Some(persistent), _) => persistent.as_ref(),
+                (None, Some(ephemeral)) => ephemeral,
+                _ => unreachable!("either injected or fallback session is set"),
+            };
             let input_guardrails = definition
                 .input_guardrails
                 .iter()
@@ -272,7 +300,7 @@ impl SubAgentInvocation {
                 .collect::<Vec<_>>();
             let deps = RunnerDeps {
                 orchestrator: definition.orchestrator.as_ref(),
-                session: &session,
+                session,
                 memory_manager: definition.memory_manager.as_deref(),
                 hooks: None,
                 max_turns: definition.max_turns,
@@ -346,11 +374,25 @@ pub fn child_input_envelope(
         Value::String(parent_state.run_id.as_str().to_owned()),
     );
 
+    // Stable conversation id: derived from the parent's *user-conversation*
+    // id (read off the most recent transcript item's metadata, where the
+    // runner stamps it on every inbound). Sticking to parent_run_id here
+    // would mint a new sub-agent conversation every turn and the persistent
+    // session would never accumulate history.
+    let parent_conversation_id = parent_state
+        .transcript
+        .items
+        .last()
+        .and_then(|item| item.metadata.get("conversation_id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| parent_state.run_id.as_str().to_owned());
+
     Envelope {
         channel_id: ChannelId::new(format!("subagent:{}", spec.agent_id.as_str())),
         conversation_id: ConversationId::new(format!(
             "{}:{}",
-            parent_state.run_id.as_str(),
+            parent_conversation_id,
             spec.agent_id.as_str()
         )),
         sender: Arc::from(parent_state.active_agent.as_str()),
@@ -391,10 +433,19 @@ mod tests {
     }
 
     fn parent_state_with_user_message() -> RunState {
-        let mut state = RunState::new(ProtoRunId::new("parent-run"), AgentId::new("parent-agent"));
+        parent_state_with_run_and_conv("parent-run", "tg-12345")
+    }
+
+    fn parent_state_with_run_and_conv(run_id: &str, conv_id: &str) -> RunState {
+        let mut state = RunState::new(ProtoRunId::new(run_id), AgentId::new("parent-agent"));
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            Arc::from("conversation_id"),
+            Value::String(conv_id.to_owned()),
+        );
         state.transcript.items.push(Item {
             message: user_message_with_attachment(),
-            metadata: Default::default(),
+            metadata,
         });
         state
     }
@@ -444,5 +495,38 @@ mod tests {
         let envelope = child_input_envelope(&spec, &parent);
         assert_eq!(envelope.message.content.as_ref(), "now do this");
         assert_eq!(envelope.message.attachments.len(), 0);
+    }
+
+    #[test]
+    fn child_envelope_uses_parent_conversation_id() {
+        let parent = parent_state_with_user_message();
+        let spec = spec_with_prompt("hi");
+        let envelope = child_input_envelope(&spec, &parent);
+        assert_eq!(envelope.conversation_id.as_str(), "tg-12345:worker");
+    }
+
+    #[test]
+    fn child_envelope_conv_id_stable_across_parent_run_ids() {
+        let turn1 = parent_state_with_run_and_conv("parent-run-1", "tg-12345");
+        let turn2 = parent_state_with_run_and_conv("parent-run-2", "tg-12345");
+        let spec = spec_with_prompt("hi");
+        let env1 = child_input_envelope(&spec, &turn1);
+        let env2 = child_input_envelope(&spec, &turn2);
+        assert_eq!(env1.conversation_id, env2.conversation_id);
+    }
+
+    #[test]
+    fn child_envelope_falls_back_when_parent_metadata_missing() {
+        // No conversation_id in the parent's transcript metadata — fall back
+        // to the old run-id-derived form so embedded callers without a runner
+        // continue to work.
+        let mut parent = RunState::new(ProtoRunId::new("parent-run"), AgentId::new("parent-agent"));
+        parent.transcript.items.push(Item {
+            message: user_message_with_attachment(),
+            metadata: Default::default(),
+        });
+        let spec = spec_with_prompt("hi");
+        let envelope = child_input_envelope(&spec, &parent);
+        assert_eq!(envelope.conversation_id.as_str(), "parent-run:worker");
     }
 }
