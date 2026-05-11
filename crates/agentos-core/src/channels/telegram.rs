@@ -131,13 +131,6 @@ impl TelegramChannel {
                 .target_path(conversation, message_id, &desc.name)?;
             self.download_to(&desc.file_id, &path)?;
             let size = desc.size.or_else(|| file_size(&path));
-            eprintln!(
-                "telegram: downloaded {} ({} bytes, mime={:?}) -> {}",
-                desc.name,
-                size.unwrap_or(0),
-                desc.mime.as_deref(),
-                path.display()
-            );
             out.push(Attachment {
                 kind: desc.kind.clone(),
                 name: Arc::from(desc.name.as_str()),

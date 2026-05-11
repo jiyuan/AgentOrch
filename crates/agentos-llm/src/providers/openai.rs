@@ -23,7 +23,6 @@ pub async fn complete(model: &str, messages: &[Message]) -> Result<String, Strin
         headers.push(("OpenAI-Project", project));
     }
     let serialized = messages.iter().map(build_message).collect::<Vec<_>>();
-    log_request_shape(model, &serialized);
     let payload = json!({
         "model": model,
         "messages": serialized,
@@ -56,41 +55,12 @@ pub async fn complete(model: &str, messages: &[Message]) -> Result<String, Strin
         })
 }
 
-/// Print a one-line summary of the request being sent to OpenAI so operators
-/// can verify the new multimodal path is engaged. Lists block types per
-/// message; never logs base64 payloads.
-fn log_request_shape(model: &str, messages: &[Value]) {
-    let summary = messages
-        .iter()
-        .map(|msg| {
-            let role = msg.get("role").and_then(Value::as_str).unwrap_or("?");
-            let kinds = match msg.get("content") {
-                Some(Value::String(_)) => "string".to_owned(),
-                Some(Value::Array(blocks)) => blocks
-                    .iter()
-                    .map(|b| b.get("type").and_then(Value::as_str).unwrap_or("?"))
-                    .collect::<Vec<_>>()
-                    .join("+"),
-                _ => "<none>".to_owned(),
-            };
-            format!("{role}=[{kinds}]")
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    eprintln!("openai request: model={model} messages=[{summary}]");
-}
-
 fn build_message(message: &Message) -> Value {
     let role = match message.role {
         MessageRole::Assistant => "assistant",
         MessageRole::System => "system",
         MessageRole::Tool | MessageRole::User => "user",
     };
-    eprintln!(
-        "openai build_message: role={role} content_len={} attachments={}",
-        message.content.len(),
-        message.attachments.len()
-    );
 
     let base_text = if message.role == MessageRole::Tool {
         format!("Tool result: {}", message.content)
@@ -165,46 +135,23 @@ fn image_block(attachment: &Attachment) -> Option<Value> {
 /// the text descriptor — Chat Completions has no generic binary shape.
 fn document_block(attachment: &Attachment) -> Option<Value> {
     if let Some(media_type) = document_mime(attachment) {
-        match read_base64(&attachment.path) {
-            Ok(data) => {
-                let file_data = format!("data:{media_type};base64,{data}");
-                return Some(json!({
-                    "type": "file",
-                    "file": {
-                        "filename": attachment.name.as_ref(),
-                        "file_data": file_data,
-                    }
-                }));
-            }
-            Err(err) => {
-                eprintln!(
-                    "openai: PDF attachment {} skipped: {err}",
-                    attachment.path.display()
-                );
-            }
-        }
-    }
-    match read_text_document(attachment) {
-        Some(Ok(body)) => {
-            let formatted = format_text_document(&attachment.name, &body);
+        if let Ok(data) = read_base64(&attachment.path) {
+            let file_data = format!("data:{media_type};base64,{data}");
             return Some(json!({
-                "type": "text",
-                "text": formatted,
+                "type": "file",
+                "file": {
+                    "filename": attachment.name.as_ref(),
+                    "file_data": file_data,
+                }
             }));
         }
-        Some(Err(err)) => {
-            eprintln!(
-                "openai: text attachment {} skipped: {err}",
-                attachment.path.display()
-            );
-        }
-        None => {
-            eprintln!(
-                "openai: attachment {} not recognised as PDF or text-like (mime={:?})",
-                attachment.path.display(),
-                attachment.mime.as_deref()
-            );
-        }
+    }
+    if let Some(Ok(body)) = read_text_document(attachment) {
+        let formatted = format_text_document(&attachment.name, &body);
+        return Some(json!({
+            "type": "text",
+            "text": formatted,
+        }));
     }
     None
 }

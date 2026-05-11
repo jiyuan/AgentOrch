@@ -318,19 +318,24 @@ pub fn child_input_envelope(
     spec: &SubAgentSpec,
     parent_state: &agentos_interfaces::RunState,
 ) -> Envelope {
-    let message = spec
-        .metadata
-        .get("prompt")
-        .and_then(Value::as_str)
-        .map(|prompt| Message::text(MessageRole::User, prompt))
-        .or_else(|| {
-            parent_state
-                .transcript
-                .items
-                .last()
-                .map(|item| item.message.clone())
-        })
-        .unwrap_or_else(|| Message::text(MessageRole::User, ""));
+    let prompt = spec.metadata.get("prompt").and_then(Value::as_str);
+    let parent_last = parent_state
+        .transcript
+        .items
+        .last()
+        .map(|item| &item.message);
+    let message = match (prompt, parent_last) {
+        // Routing handoff supplied a prompt string, and the parent's last
+        // turn is the user's inbound message — carry that message's
+        // attachments forward so the sub-agent can actually read the files
+        // the user just sent.
+        (Some(prompt), Some(parent_msg)) if parent_msg.role == MessageRole::User => {
+            Message::with_attachments(MessageRole::User, prompt, parent_msg.attachments.clone())
+        }
+        (Some(prompt), _) => Message::text(MessageRole::User, prompt),
+        (None, Some(parent_msg)) => parent_msg.clone(),
+        (None, None) => Message::text(MessageRole::User, ""),
+    };
     let mut metadata = spec.metadata.clone();
     metadata.insert(
         Arc::from("kind"),
@@ -360,4 +365,84 @@ pub fn child_run_id(spec: &SubAgentSpec, parent_state: &agentos_interfaces::RunS
         parent_state.run_id.as_str(),
         spec.agent_id.as_str()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentos_interfaces::session::Item;
+    use agentos_interfaces::RunState;
+    use agentos_proto::{AgentId, Attachment, AttachmentKind, MessageRole, RunId as ProtoRunId};
+    use std::path::PathBuf;
+
+    fn user_message_with_attachment() -> agentos_proto::Message {
+        agentos_proto::Message::with_attachments(
+            MessageRole::User,
+            "look at this",
+            vec![Attachment {
+                kind: AttachmentKind::Document,
+                name: Arc::from("SKILL.md"),
+                path: PathBuf::from("workspace/attachments/telegram/1/2/SKILL.md"),
+                mime: None,
+                size: Some(2448),
+                source: Some(Arc::from("file_xyz")),
+            }],
+        )
+    }
+
+    fn parent_state_with_user_message() -> RunState {
+        let mut state = RunState::new(ProtoRunId::new("parent-run"), AgentId::new("parent-agent"));
+        state.transcript.items.push(Item {
+            message: user_message_with_attachment(),
+            metadata: Default::default(),
+        });
+        state
+    }
+
+    fn spec_with_prompt(prompt: &str) -> SubAgentSpec {
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert(Arc::from("prompt"), Value::String(prompt.to_owned()));
+        SubAgentSpec {
+            agent_id: AgentId::new("worker"),
+            policy_id: Arc::from("default"),
+            metadata,
+        }
+    }
+
+    #[test]
+    fn child_envelope_carries_parent_attachments_when_prompt_present() {
+        let parent = parent_state_with_user_message();
+        let spec = spec_with_prompt("hi");
+        let envelope = child_input_envelope(&spec, &parent);
+        assert_eq!(envelope.message.content.as_ref(), "hi");
+        assert_eq!(envelope.message.attachments.len(), 1);
+        assert_eq!(envelope.message.attachments[0].name.as_ref(), "SKILL.md");
+    }
+
+    #[test]
+    fn child_envelope_uses_parent_message_when_no_prompt() {
+        let parent = parent_state_with_user_message();
+        let spec = SubAgentSpec {
+            agent_id: AgentId::new("worker"),
+            policy_id: Arc::from("default"),
+            metadata: Default::default(),
+        };
+        let envelope = child_input_envelope(&spec, &parent);
+        assert_eq!(envelope.message.content.as_ref(), "look at this");
+        assert_eq!(envelope.message.attachments.len(), 1);
+    }
+
+    #[test]
+    fn child_envelope_skips_attachments_when_parent_is_not_user_turn() {
+        let mut parent = RunState::new(ProtoRunId::new("parent-run"), AgentId::new("parent-agent"));
+        // Assistant turn — no attachments to inherit.
+        parent.transcript.items.push(Item {
+            message: agentos_proto::Message::text(MessageRole::Assistant, "previous reply"),
+            metadata: Default::default(),
+        });
+        let spec = spec_with_prompt("now do this");
+        let envelope = child_input_envelope(&spec, &parent);
+        assert_eq!(envelope.message.content.as_ref(), "now do this");
+        assert_eq!(envelope.message.attachments.len(), 0);
+    }
 }

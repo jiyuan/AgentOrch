@@ -215,11 +215,6 @@ pub async fn run_envelope(
         message: input.message.clone(),
         metadata: input_metadata,
     };
-    eprintln!(
-        "runner: input message attachments={} (conv={})",
-        input_item.message.attachments.len(),
-        input.conversation_id.as_str()
-    );
     transcript.items.push(input_item);
 
     let mut state = RunState::new(run_id.clone(), deps.active_agent.clone());
