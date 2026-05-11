@@ -65,6 +65,7 @@ dependencies = [
  "agentos-interfaces",
  "agentos-proto",
  "async-trait",
+ "base64",
  "rand 0.8.6",
  "reqwest",
  "serde",

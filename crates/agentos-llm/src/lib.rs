@@ -219,12 +219,11 @@ impl Llm for EnvLlm {
             return Err(LlmError::Unconfigured(Arc::from(self.tier.name())));
         };
         validate_llm_selection(&selection).map_err(|err| LlmError::Provider(Arc::from(err)))?;
-        let messages = messages.iter().map(chat_message).collect::<Vec<_>>();
         let content = match selection.provider.as_ref() {
-            "openai" => providers::openai::complete(&selection.model, &messages).await,
-            "anthropic" => providers::anthropic::complete(&selection.model, &messages).await,
-            "deepseek" => providers::deepseek::complete(&selection.model, &messages).await,
-            "ollama" => providers::ollama::complete(&selection.model, &messages).await,
+            "openai" => providers::openai::complete(&selection.model, messages).await,
+            "anthropic" => providers::anthropic::complete(&selection.model, messages).await,
+            "deepseek" => providers::deepseek::complete(&selection.model, messages).await,
+            "ollama" => providers::ollama::complete(&selection.model, messages).await,
             other => Err(format!("unknown LLM provider: {other}")),
         }
         .map_err(|err| LlmError::Provider(Arc::from(err)))?;
@@ -357,21 +356,4 @@ fn env_presence(names: &[&str]) -> &'static str {
     } else {
         "unset"
     }
-}
-
-fn chat_message(message: &Message) -> serde_json::Value {
-    let role = match message.role {
-        MessageRole::Assistant => "assistant",
-        MessageRole::System => "system",
-        MessageRole::Tool | MessageRole::User => "user",
-    };
-    let content = if message.role == MessageRole::Tool {
-        format!("Tool result: {}", message.content)
-    } else {
-        message.content.to_string()
-    };
-    serde_json::json!({
-        "role": role,
-        "content": content
-    })
 }
