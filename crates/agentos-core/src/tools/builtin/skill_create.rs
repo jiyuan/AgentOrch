@@ -164,16 +164,21 @@ impl Tool for SkillCreatorTool {
         let skill = create_skill(&root, &creation)
             .map_err(|err| ToolError::Failed(Arc::from(err.to_string())))?;
 
-        let message = if file_count == 0 {
-            format!("created skill '{}' at {}", skill.name, skill.path.display())
-        } else {
-            format!(
-                "created skill '{}' at {} with {file_count} bundle file{}",
-                skill.name,
-                skill.path.display(),
-                if file_count == 1 { "" } else { "s" }
-            )
-        };
+        // Audit what's actually on disk under the canonical skill path and
+        // report it in the success message. If a write silently failed the
+        // count won't match the message, so the user (and the LLM on the
+        // next turn) can detect the discrepancy. Counts include SKILL.md
+        // and every file under the skill directory recursively.
+        let audit = audit_skill_dir(&skill.path);
+        let message = format!(
+            "created skill '{}' at {} ({} file{} on disk; requested {} bundle file{})",
+            skill.name,
+            skill.path.display(),
+            audit.total_files,
+            if audit.total_files == 1 { "" } else { "s" },
+            file_count,
+            if file_count == 1 { "" } else { "s" },
+        );
         let bytes_out = message.len() as u64;
         Ok(ToolResult {
             call_id: call.id.clone(),
@@ -182,6 +187,29 @@ impl Tool for SkillCreatorTool {
             metadata: result_metadata(elapsed_ms(start), bytes_out),
         })
     }
+}
+
+struct SkillDirAudit {
+    total_files: usize,
+}
+
+fn audit_skill_dir(path: &std::path::Path) -> SkillDirAudit {
+    let mut total_files = 0;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                stack.push(entry_path);
+            } else {
+                total_files += 1;
+            }
+        }
+    }
+    SkillDirAudit { total_files }
 }
 
 #[cfg(test)]
@@ -404,6 +432,77 @@ mod tests {
             std::fs::read_to_string(guard.dir.join("redo-skill").join("scripts").join("run.py"))
                 .unwrap();
         assert_eq!(run_py, "print('recovered')\n");
+    }
+
+    #[tokio::test]
+    async fn skill_creator_tool_message_disk_count_matches_actual_files() {
+        // Audit guard: the tool message reports both the requested file
+        // count and the actual on-disk file count. These must agree on a
+        // healthy filesystem. If they don't, the user can see the
+        // discrepancy in the reply instead of being told a success that
+        // didn't happen.
+        let guard = SkillsDirGuard::new("skill-creator-audit");
+        let args = json!({
+            "name": "audit-skill",
+            "description": "Audit-test that disk count matches message.",
+            "resources": ["scripts", "references"],
+            "body": "# Audit Skill\n\nBody body body.\n",
+            "files": [
+                { "path": "scripts/aggregate.py", "content": "x = 1\n" },
+                { "path": "references/notes.md", "content": "notes\n" }
+            ],
+        });
+        let raw = RawValue::from_string(args.to_string()).unwrap();
+        let result = SkillCreatorTool
+            .call(&tool_call("skill_create", "audit"), &raw)
+            .await
+            .unwrap();
+        assert_eq!(result.status, ToolStatus::Succeeded);
+        // SKILL.md + 2 bundle files = 3 files on disk total.
+        assert!(
+            result.content.contains("3 files on disk"),
+            "expected message to report 3 files on disk, got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("requested 2 bundle files"),
+            "expected message to report 2 requested bundle files, got: {}",
+            result.content
+        );
+
+        // Independently verify on disk.
+        let skill_dir = guard.dir.join("audit-skill");
+        assert!(skill_dir.join("SKILL.md").is_file());
+        assert!(skill_dir.join("scripts").join("aggregate.py").is_file());
+        assert!(skill_dir.join("references").join("notes.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn skill_creator_tool_reports_absolute_path_in_message() {
+        // The skill_create tool's success message must point at an
+        // absolute, canonicalised path so users with a different shell
+        // CWD than the gateway process can still find the bundle.
+        let guard = SkillsDirGuard::new("skill-creator-abspath");
+        let args = json!({
+            "name": "abs-skill",
+            "description": "Path-in-message audit.",
+            "body": "# Abs\n\nbody.\n",
+        });
+        let raw = RawValue::from_string(args.to_string()).unwrap();
+        let result = SkillCreatorTool
+            .call(&tool_call("skill_create", "abs"), &raw)
+            .await
+            .unwrap();
+        // SkillsDirGuard creates a tempdir at an absolute path. The message
+        // must include that absolute path, not a relative one.
+        let canonical = guard.dir.canonicalize().unwrap();
+        let expected = canonical.join("abs-skill");
+        assert!(
+            result.content.contains(&*expected.to_string_lossy()),
+            "expected message to contain absolute path {}, got: {}",
+            expected.display(),
+            result.content
+        );
     }
 
     #[tokio::test]

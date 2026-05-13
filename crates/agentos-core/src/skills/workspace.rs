@@ -230,10 +230,11 @@ pub fn create_skill(
         body.trim_end()
     );
     let skill_file = skill_dir.join(SKILL_FILE);
-    fs::write(&skill_file, content).map_err(|source| SkillStoreError::Io {
-        path: skill_file,
+    fs::write(&skill_file, &content).map_err(|source| SkillStoreError::Io {
+        path: skill_file.clone(),
         source,
     })?;
+    verify_written(&skill_file, content.len())?;
 
     for file in &creation.files {
         let target = resolve_bundle_path(&skill_dir, &file.path).map_err(|message| {
@@ -248,13 +249,46 @@ pub fn create_skill(
                 source,
             })?;
         }
-        fs::write(&target, file.content.as_bytes()).map_err(|source| SkillStoreError::Io {
-            path: target,
+        let bytes = file.content.as_bytes();
+        fs::write(&target, bytes).map_err(|source| SkillStoreError::Io {
+            path: target.clone(),
             source,
         })?;
+        verify_written(&target, bytes.len())?;
     }
 
-    validate_skill_dir(&skill_dir)
+    let mut skill = validate_skill_dir(&skill_dir)?;
+    // Canonicalise the returned path so the success message reports an
+    // absolute, symlink-resolved location. Without this the message
+    // displays whatever relative path `skill_dir` was constructed from,
+    // and a user looking at the workspace from a shell with a different
+    // CWD can't tell where the bundle actually landed.
+    if let Ok(canonical) = skill_dir.canonicalize() {
+        skill.path = canonical;
+    }
+    Ok(skill)
+}
+
+/// Stat a freshly-written file and confirm it exists with the expected size.
+/// Catches the (rare but observed) "tool reports success but disk is empty"
+/// failure mode: a NFS/overlay/permissions oddity that swallows the write
+/// without surfacing an `io::Error` from `fs::write`. We'd rather fail loud
+/// here than leave the LLM telling the user a lie.
+fn verify_written(path: &Path, expected_bytes: usize) -> Result<(), SkillStoreError> {
+    let metadata = fs::metadata(path).map_err(|source| SkillStoreError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let actual = metadata.len() as usize;
+    if actual != expected_bytes {
+        return Err(SkillStoreError::Invalid {
+            path: path.to_path_buf(),
+            message: format!(
+                "post-write verification failed: expected {expected_bytes} bytes, found {actual}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Resolve `requested` against `skill_dir`, rejecting absolute paths,

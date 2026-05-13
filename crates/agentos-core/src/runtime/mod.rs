@@ -182,16 +182,27 @@ impl AgentRuntime {
         // Skill catalog must be loaded before sub-agents are built so sub-agent
         // MaxOrchestrators can hold a clone of it and dispatch skills (e.g.
         // web-research, skill-creator).
-        let resolved_skills_root = skills_root(&paths.agent_config_path);
+        //
+        // Resolve to an absolute path so the skills root is independent of
+        // the gateway process's CWD. If the gateway was launched with a
+        // relative --config (the default is `workspace/agent.toml`), then
+        // `skills_root` returns a relative path, and every later `fs::write`
+        // call resolves it against whatever CWD the gateway happened to
+        // inherit. The user looking at the workspace from a shell with a
+        // different CWD would then see an empty/missing directory while the
+        // tool reports success. Anchor on CWD-at-startup once and use that
+        // resolved absolute path everywhere downstream.
+        let resolved_skills_root = absolutise(&skills_root(&paths.agent_config_path));
         // Pin `AGENTOS_SKILLS_DIR` to the same absolute path the loader uses,
         // so the `skill_create` tool's `default_skills_dir` resolves to the
-        // same directory regardless of the gateway process's CWD. Without
-        // this, the tool would write to `<cwd>/workspace/skills` while the
-        // loader reads from `<agent_config_dir>/skills`, and freshly created
-        // skills appear to vanish.
+        // same directory regardless of the gateway process's CWD.
         if std::env::var_os("AGENTOS_SKILLS_DIR").is_none() {
             std::env::set_var("AGENTOS_SKILLS_DIR", &resolved_skills_root);
         }
+        tracing::info!(
+            skills_root = %resolved_skills_root.display(),
+            "skills root resolved"
+        );
         let skill_catalog = WorkspaceSkillCatalog::load_enabled(
             &resolved_skills_root,
             &workspace_config.resources.skills.enabled,
@@ -262,6 +273,21 @@ pub fn skills_root(agent_config_path: &Path) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("skills")
+}
+
+/// Resolve `path` to an absolute path against the process CWD at the moment
+/// of the call. Used at startup so the skills root the runtime hands to the
+/// `skill_create` tool is CWD-independent. Falls back to the input path if
+/// `current_dir` fails (e.g. CWD was unlinked) — in that pathological case
+/// we'd rather keep going than refuse to start.
+fn absolutise(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path.to_path_buf(),
+    }
 }
 
 pub fn load_workspace_config(path: &Path) -> Result<WorkspaceConfig, std::io::Error> {
