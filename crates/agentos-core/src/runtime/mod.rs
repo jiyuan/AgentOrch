@@ -14,7 +14,7 @@ use crate::subagents::{SubAgentDefinition, SubAgentRegistry};
 use crate::task_workspace::TaskWorkspace;
 use crate::tools::{
     CronCreatorTool, CronListTool, CronRemoveTool, FileTool, HttpTool, MemoryTool, ShellTool,
-    SkillCreatorTool, StaticMcpClient, StaticMcpTool, StdioMcpClient, ToolRegistry,
+    SkillValidateTool, StaticMcpClient, StaticMcpTool, StdioMcpClient, ToolRegistry,
 };
 use agentos_interfaces::mcp::{McpClient, McpServer};
 use agentos_interfaces::orchestrator::{
@@ -203,6 +203,8 @@ impl AgentRuntime {
             skills_root = %resolved_skills_root.display(),
             "skills root resolved"
         );
+        probe_skills_root(&resolved_skills_root)
+            .map_err(|err| format!("skills root write probe failed: {err}"))?;
         let skill_catalog = WorkspaceSkillCatalog::load_enabled(
             &resolved_skills_root,
             &workspace_config.resources.skills.enabled,
@@ -288,6 +290,44 @@ fn absolutise(path: &Path) -> PathBuf {
         Ok(cwd) => cwd.join(path),
         Err(_) => path.to_path_buf(),
     }
+}
+
+/// Write-and-delete a small probe file under the skills root at startup.
+/// If anything fails, the gateway refuses to start with a clear error.
+/// This rules out the "writes silently swallowed by overlay/NFS/permissions"
+/// failure mode — if the probe succeeds, every later `skill_create` write
+/// that returns `Ok` from `fs::write` really did land on disk at that
+/// location.
+fn probe_skills_root(root: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(root)
+        .map_err(|err| format!("cannot create skills root '{}': {err}", root.display()))?;
+    let probe = root.join(format!(".agentos-probe-{}", std::process::id()));
+    std::fs::write(&probe, b"agentos skills root probe")
+        .map_err(|err| format!("cannot write to skills root '{}': {err}", root.display()))?;
+    let metadata = std::fs::metadata(&probe).map_err(|err| {
+        format!(
+            "probe file '{}' could not be stat'd after write: {err}",
+            probe.display()
+        )
+    })?;
+    if metadata.len() == 0 {
+        let _ = std::fs::remove_file(&probe);
+        return Err(format!(
+            "probe file '{}' was written but reads back as zero bytes",
+            probe.display()
+        ));
+    }
+    std::fs::remove_file(&probe).map_err(|err| {
+        format!(
+            "probe file '{}' could not be removed: {err}",
+            probe.display()
+        )
+    })?;
+    tracing::info!(
+        skills_root = %root.display(),
+        "skills root write probe succeeded"
+    );
+    Ok(())
 }
 
 pub fn load_workspace_config(path: &Path) -> Result<WorkspaceConfig, std::io::Error> {
@@ -742,7 +782,7 @@ pub fn register_builtin_tool(tools: &mut ToolRegistry, name: &str) {
         "shell" => tools.register(ShellTool),
         "http" => tools.register(HttpTool),
         "file" => tools.register(FileTool),
-        "skill_create" => tools.register(SkillCreatorTool),
+        "skill_validate" => tools.register(SkillValidateTool),
         "cron_create" => tools.register(CronCreatorTool),
         "cron_list" => tools.register(CronListTool),
         "cron_remove" => tools.register(CronRemoveTool),

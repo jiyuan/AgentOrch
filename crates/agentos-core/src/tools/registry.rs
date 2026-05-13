@@ -1,6 +1,6 @@
 use super::{
     CronCreatorTool, CronListTool, CronRemoveTool, FileTool, HttpTool, McpTool, MemoryTool,
-    ShellTool, SkillCreatorTool,
+    ShellTool, SkillValidateTool,
 };
 use crate::memory::MemoryManager;
 use agentos_interfaces::mcp::{McpClient, McpError, McpServer};
@@ -41,7 +41,7 @@ impl ToolRegistry {
         registry.register(ShellTool);
         registry.register(HttpTool);
         registry.register(FileTool);
-        registry.register(SkillCreatorTool);
+        registry.register(SkillValidateTool);
         registry.register(CronCreatorTool);
         registry.register(CronListTool);
         registry.register(CronRemoveTool);

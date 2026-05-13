@@ -1,15 +1,16 @@
 //! Deterministic planner for the `skill-creator` workspace skill.
 //!
-//! Detects compact "create skill: NAME, DESCRIPTION [, resources=...]" prefixes
-//! in the latest user message and emits a `Plan::CallTool` against the
-//! `skill_create` built-in tool. Natural-language requests are left to the
-//! LLM, which sees `skill_create` in its tools schema and can call it
-//! directly.
+//! Detects compact "create skill: NAME, DESCRIPTION" prefixes in the latest
+//! user message and emits a `Plan::CallTool` against the `file` tool that
+//! scaffolds a valid `SKILL.md` under `workspace/skills/<name>/`. From there
+//! the LLM is expected to populate the body (via the `file` tool) and call
+//! `skill_validate` to confirm. Natural-language requests don't match this
+//! prefix and are handled entirely by the LLM through the same two tools.
 
 use super::{SkillPlanner, WorkspaceSkillCatalog};
 use agentos_interfaces::orchestrator::{OrchestratorError, Plan, RunContext};
 use agentos_proto::{Message, MessageRole, ToolCall, ToolCallId};
-use serde_json::{json, value::RawValue, Value};
+use serde_json::{json, value::RawValue};
 use std::sync::Arc;
 
 pub struct SkillCreatorSkill {
@@ -35,29 +36,38 @@ impl SkillPlanner for SkillCreatorSkill {
             return Ok(None);
         };
         match item.message.role {
-            MessageRole::User => plan_create(&item.message.content),
+            MessageRole::User => plan_scaffold(&item.message.content),
             MessageRole::Tool => plan_acknowledgement(ctx),
             MessageRole::Assistant | MessageRole::System => Ok(None),
         }
     }
 }
 
-fn plan_create(input: &str) -> Result<Option<Plan>, OrchestratorError> {
+fn plan_scaffold(input: &str) -> Result<Option<Plan>, OrchestratorError> {
     let Some(parsed) = parse_create_prefix(input) else {
         return Ok(None);
     };
-    let mut args = json!({
-        "name": parsed.name,
-        "description": parsed.description,
+    // Emit a `file` write that lays down a valid `SKILL.md` skeleton for
+    // the requested name. The LLM then sees the tool result and is expected
+    // to follow up: write any additional body content / bundled resources
+    // via the same `file` tool, then call `skill_validate` to confirm the
+    // result parses. Tool = validator, LLM = generator — keep them separate.
+    let frontmatter = format!(
+        "---\nname: {}\ndescription: {}\n---\n\n# {}\n\n*Body intentionally minimal — fill in with the workflow this skill standardises, then call `skill_validate`.*\n",
+        parsed.name,
+        parsed.description,
+        title_from_name(&parsed.name),
+    );
+    let args = json!({
+        "operation": "write",
+        "path": format!("workspace/skills/{}/SKILL.md", parsed.name),
+        "content": frontmatter,
     });
-    if !parsed.resources.is_empty() {
-        args["resources"] = Value::from(parsed.resources.clone());
-    }
     let raw_args = RawValue::from_string(args.to_string())
         .map_err(|err| OrchestratorError::Backend(err.to_string().into()))?;
     Ok(Some(Plan::CallTool(ToolCall {
         id: ToolCallId::new(format!("skill-creator-{}", parsed.name)),
-        name: Arc::from("skill_create"),
+        name: Arc::from("file"),
         args: raw_args,
     })))
 }
@@ -69,22 +79,33 @@ fn plan_acknowledgement(ctx: &RunContext<'_>) -> Result<Option<Plan>, Orchestrat
     let Some(item) = ctx.state.transcript.items.last() else {
         return Ok(None);
     };
-    // Echo the tool's success message back as the assistant reply so the
-    // run can complete without a second LLM round-trip when the prefix
-    // shortcut is used. Natural-language requests skip this branch
-    // because `previous_user_requested_skill_create` only matches the
-    // explicit `create skill:` prefix.
+    // Echo the `file` tool's success message back as the assistant reply so
+    // the prefix shortcut completes without a second LLM round-trip. The
+    // user then drives the rest of the workflow (populate the body via
+    // `file`, run `skill_validate`) through natural-language follow-ups.
     Ok(Some(Plan::Reply(Message::text(
         MessageRole::Assistant,
         Arc::clone(&item.message.content),
     ))))
 }
 
+fn title_from_name(name: &str) -> String {
+    name.split('-')
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[derive(Debug, PartialEq)]
 struct ParsedCreate {
     name: String,
     description: String,
-    resources: Vec<String>,
 }
 
 fn parse_create_prefix(input: &str) -> Option<ParsedCreate> {
@@ -92,9 +113,7 @@ fn parse_create_prefix(input: &str) -> Option<ParsedCreate> {
         .strip_prefix("create skill:")
         .or_else(|| input.strip_prefix("skill create:"))?
         .trim();
-    // Split on the first comma between name and description, then process any
-    // trailing `resources=a|b|c` field tolerantly.
-    let mut parts = body.splitn(3, ',').map(str::trim).collect::<Vec<_>>();
+    let mut parts = body.splitn(2, ',').map(str::trim).collect::<Vec<_>>();
     let name = parts.first()?.to_string();
     if name.is_empty() {
         return None;
@@ -103,26 +122,8 @@ fn parse_create_prefix(input: &str) -> Option<ParsedCreate> {
     if description.is_empty() {
         return None;
     }
-    let resources = parts
-        .pop()
-        .filter(|_| parts.len() >= 2)
-        .and_then(parse_resources_tail)
-        .unwrap_or_default();
-    Some(ParsedCreate {
-        name,
-        description,
-        resources,
-    })
-}
-
-fn parse_resources_tail(tail: &str) -> Option<Vec<String>> {
-    let rest = tail.strip_prefix("resources=")?;
-    Some(
-        rest.split(['|', ','])
-            .map(|s| s.trim().to_ascii_lowercase())
-            .filter(|s| matches!(s.as_str(), "scripts" | "references" | "assets"))
-            .collect(),
-    )
+    parts.clear();
+    Some(ParsedCreate { name, description })
 }
 
 fn previous_user_requested_skill_create(ctx: &RunContext<'_>) -> bool {
@@ -145,7 +146,6 @@ mod tests {
             .expect("should parse");
         assert_eq!(parsed.name, "rss-digest");
         assert_eq!(parsed.description, "fetch and summarize feeds");
-        assert!(parsed.resources.is_empty());
     }
 
     #[test]
@@ -153,15 +153,6 @@ mod tests {
         let parsed =
             parse_create_prefix("skill create: foo, bar baz").expect("synonym should parse");
         assert_eq!(parsed.name, "foo");
-    }
-
-    #[test]
-    fn parses_optional_resources() {
-        let parsed = parse_create_prefix(
-            "create skill: rss-digest, fetch feeds, resources=scripts|references",
-        )
-        .expect("should parse");
-        assert_eq!(parsed.resources, vec!["scripts", "references"]);
     }
 
     #[test]

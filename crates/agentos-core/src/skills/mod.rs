@@ -7,6 +7,6 @@ pub use planner::{builtin_skill_planners, SkillPlanner};
 pub use skill_creator::SkillCreatorSkill;
 pub use web_research::WebResearchSkill;
 pub use workspace::{
-    create_skill, validate_skill_dir, SkillBundleFile, SkillCreation, SkillResourceKind,
-    SkillStoreError, WorkspaceSkill, WorkspaceSkillCatalog, WorkspaceSkillMetadata,
+    create_skill, validate_skill_dir, SkillCreation, SkillResourceKind, SkillStoreError,
+    WorkspaceSkill, WorkspaceSkillCatalog, WorkspaceSkillMetadata,
 };

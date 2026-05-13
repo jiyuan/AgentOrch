@@ -74,8 +74,12 @@ AgentOS supports two routes into a skill:
    `RunContext` and returns a `Plan` deterministically. This is how
    `skill-creator` and `web-research` short-circuit common requests
    without paying for an LLM round-trip.
-2. **`skill_create` (and similar) tools** — the LLM sees the tool in its
-   schema and decides to call it.
+2. **Tool calls** — the LLM sees tools in its schema and decides which to
+   call. Skill creation uses the standard `file` tool to write SKILL.md
+   and bundled resources, then calls the `skill_validate` tool to confirm
+   the result parses. There is intentionally no `skill_create` write tool:
+   keeping generation in the LLM and validation in a dedicated tool gives
+   the LLM a clear feedback signal it can loop on.
 
 Both routes share the same approval, guardrail, and trace flow. When you
 build a new skill for AgentOS, prefer the LLM-tool route by default; only
@@ -83,13 +87,16 @@ add a `SkillPlanner` for prefix shortcuts that need to be free.
 
 ### Validation entry points
 
-- **From the agent process**: `agentos skill validate <name>` (Rust). This
-  is what the loader runs at startup and what `skill_create` runs before
-  returning.
-- **From the command line, outside the agent**: `python3 scripts/quick_validate.py <skill-path>`.
-  Same shape checks plus the optional-field validation (`license`,
-  `allowed-tools`, `metadata`, `compatibility`) that the Rust validator
-  ignores.
+- **From the LLM, inside the run loop**: `skill_validate` tool. Returns
+  `PASS`+resolved path or `FAIL`+reason+hint. The model loops on this until
+  the bundle is correct.
+- **From the agent process at startup**: the runtime loader calls
+  `validate_skill_dir` on every skill under `workspace/skills/` and refuses
+  to register skills that don't parse.
+- **From the operator's shell**: `agentos skill validate <name>` (Rust) or
+  `python3 scripts/quick_validate.py <skill-path>`. The Python validator
+  also covers the optional-field schema (`license`, `allowed-tools`,
+  `metadata`, `compatibility`) that the runtime ignores.
 
 ### Workspace layout
 

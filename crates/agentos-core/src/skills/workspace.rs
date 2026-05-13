@@ -31,25 +31,6 @@ pub struct SkillCreation {
     pub name: Arc<str>,
     pub description: Arc<str>,
     pub resources: BTreeSet<SkillResourceKind>,
-    /// Optional Markdown body for SKILL.md (without the YAML frontmatter
-    /// fence — the frontmatter is rebuilt from `name` + `description`).
-    /// When `None`, a scaffolded placeholder body is written.
-    pub body: Option<Arc<str>>,
-    /// Optional bundle files to write under the skill directory in the
-    /// same call. Paths must be relative, must not contain `..`, and
-    /// must canonicalise within the skill directory.
-    pub files: Vec<SkillBundleFile>,
-    /// When `true` and the skill directory already exists, remove it
-    /// (recursively) before writing the new bundle. Recovery path for
-    /// the case where a prior `create_skill` call produced an
-    /// incomplete skeleton.
-    pub replace: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SkillBundleFile {
-    pub path: PathBuf,
-    pub content: Arc<str>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -70,12 +51,7 @@ pub enum SkillStoreError {
     Invalid { path: PathBuf, message: String },
     #[error("configured skill '{0}' was not found in workspace skills")]
     Missing(Arc<str>),
-    #[error(
-        "skill '{0}' already exists; pass `replace: true` to overwrite the \
-         existing bundle, or choose a different name. The previous call \
-         produced this directory — do not retry with the same args without \
-         setting `replace`."
-    )]
+    #[error("skill '{0}' already exists")]
     Exists(Arc<str>),
 }
 
@@ -160,9 +136,6 @@ impl SkillCreation {
             name: Arc::from(normalize_skill_name(name.as_ref())),
             description: description.into(),
             resources: BTreeSet::new(),
-            body: None,
-            files: Vec::new(),
-            replace: false,
         }
     }
 
@@ -193,14 +166,7 @@ pub fn create_skill(
     })?;
     let skill_dir = root.join(creation.name.as_ref());
     if skill_dir.exists() {
-        if creation.replace {
-            fs::remove_dir_all(&skill_dir).map_err(|source| SkillStoreError::Io {
-                path: skill_dir.clone(),
-                source,
-            })?;
-        } else {
-            return Err(SkillStoreError::Exists(Arc::clone(&creation.name)));
-        }
+        return Err(SkillStoreError::Exists(Arc::clone(&creation.name)));
     }
     fs::create_dir(&skill_dir).map_err(|source| SkillStoreError::Io {
         path: skill_dir.clone(),
@@ -219,15 +185,11 @@ pub fn create_skill(
         })?;
     }
 
-    let body = match creation.body.as_deref() {
-        Some(body) => body.to_owned(),
-        None => default_skill_body(&creation.name),
-    };
     let content = format!(
         "---\nname: {}\ndescription: {}\n---\n\n{}\n",
         creation.name,
         yaml_scalar(&creation.description),
-        body.trim_end()
+        default_skill_body(&creation.name).trim_end()
     );
     let skill_file = skill_dir.join(SKILL_FILE);
     fs::write(&skill_file, &content).map_err(|source| SkillStoreError::Io {
@@ -236,33 +198,10 @@ pub fn create_skill(
     })?;
     verify_written(&skill_file, content.len())?;
 
-    for file in &creation.files {
-        let target = resolve_bundle_path(&skill_dir, &file.path).map_err(|message| {
-            SkillStoreError::Invalid {
-                path: skill_dir.join(&file.path),
-                message,
-            }
-        })?;
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent).map_err(|source| SkillStoreError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-        let bytes = file.content.as_bytes();
-        fs::write(&target, bytes).map_err(|source| SkillStoreError::Io {
-            path: target.clone(),
-            source,
-        })?;
-        verify_written(&target, bytes.len())?;
-    }
-
     let mut skill = validate_skill_dir(&skill_dir)?;
-    // Canonicalise the returned path so the success message reports an
-    // absolute, symlink-resolved location. Without this the message
-    // displays whatever relative path `skill_dir` was constructed from,
-    // and a user looking at the workspace from a shell with a different
-    // CWD can't tell where the bundle actually landed.
+    // Canonicalise the returned path so callers (the CLI / human-facing
+    // tooling) report an absolute, symlink-resolved location rather than
+    // whatever relative path `skill_dir` was constructed from.
     if let Ok(canonical) = skill_dir.canonicalize() {
         skill.path = canonical;
     }
@@ -289,75 +228,6 @@ fn verify_written(path: &Path, expected_bytes: usize) -> Result<(), SkillStoreEr
         });
     }
     Ok(())
-}
-
-/// Resolve `requested` against `skill_dir`, rejecting absolute paths,
-/// `..` components, the bare `SKILL.md` name (which is owned by the
-/// creator), and any canonical path that escapes the skill directory
-/// (e.g. via a pre-existing symlink). Returns the absolute target path
-/// the caller should write to.
-fn resolve_bundle_path(skill_dir: &Path, requested: &Path) -> Result<PathBuf, String> {
-    use std::path::Component;
-    if requested.as_os_str().is_empty() {
-        return Err("bundle file path is empty".to_owned());
-    }
-    if requested.is_absolute() {
-        return Err(format!(
-            "bundle file path '{}' must be relative to the skill directory",
-            requested.display()
-        ));
-    }
-    for component in requested.components() {
-        match component {
-            Component::Normal(_) => {}
-            Component::CurDir => {}
-            Component::ParentDir => {
-                return Err(format!(
-                    "bundle file path '{}' may not contain '..' segments",
-                    requested.display()
-                ));
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(format!(
-                    "bundle file path '{}' must be relative to the skill directory",
-                    requested.display()
-                ));
-            }
-        }
-    }
-    let target = skill_dir.join(requested);
-    if target.file_name() == Some(std::ffi::OsStr::new(SKILL_FILE))
-        && target.parent() == Some(skill_dir)
-    {
-        return Err(format!(
-            "bundle files cannot overwrite '{SKILL_FILE}'; use the `body` field instead"
-        ));
-    }
-    // Canonicalise the deepest existing ancestor so a pre-existing symlink
-    // inside `skill_dir` can't redirect the write. If no ancestor exists
-    // yet (fresh skill dir), the lexical checks above are sufficient.
-    let mut probe = target.as_path();
-    let canonical_anchor = loop {
-        match probe.canonicalize() {
-            Ok(path) => break Some(path),
-            Err(_) => match probe.parent() {
-                Some(parent) => probe = parent,
-                None => break None,
-            },
-        }
-    };
-    if let Some(canonical_anchor) = canonical_anchor {
-        let canonical_root = skill_dir
-            .canonicalize()
-            .map_err(|err| format!("skill directory canonicalize failed: {err}"))?;
-        if !canonical_anchor.starts_with(&canonical_root) {
-            return Err(format!(
-                "bundle file path '{}' resolves outside the skill directory",
-                requested.display()
-            ));
-        }
-    }
-    Ok(target)
 }
 
 fn default_skill_body(name: &str) -> String {

@@ -68,7 +68,7 @@ enabled = [
   "http",
   "memory",
   "shell",
-  "skill_create",
+  "skill_validate",
   "cron_create",
   "cron_list",
   "cron_remove",
