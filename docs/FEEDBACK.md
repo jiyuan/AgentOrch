@@ -218,6 +218,16 @@
 - **Root Cause**: Higher-priority runtime instructions conflict with the repository's automatic delegation threshold.
 - **Suggested Fix**: Amend the repository guideline to account for environments where subagent spawning is gated by explicit user consent.
 
+## [2026-05-13 22:19] ORCHESTRATION
+
+- **Agent**: main-codex
+- **Task**: Commence development according to reconstructed PLAN.md by stabilizing policy, config, and verification invariants.
+- **Guideline Violated**: ORCHESTRATION > Subagent Delegation & Creation
+- **Expected Behavior**: Delegate tasks exceeding the tool-call threshold to a registered or built-in Subagent.
+- **Actual Behavior**: Work was performed locally because the active runtime instructions only permit spawning subagents when the user explicitly requests delegation.
+- **Root Cause**: Higher-priority runtime instructions conflict with the repository's automatic delegation threshold.
+- **Suggested Fix**: Amend the repository guideline to account for environments where subagent spawning is gated by explicit user consent.
+
 ## [2026-05-03 19:59] ORCHESTRATION
 
 - **Agent**: main-codex
@@ -427,3 +437,133 @@
 - **Actual Behavior**: Reported likely source-level fixes while the deployed gateway executable was still stale and did not include the newer Feishu filter diagnostics.
 - **Root Cause**: Validation focused on source edits and tests before checking the compiled binary contents and the live restarted process.
 - **Suggested Fix**: For gateway/channel incidents, always confirm the running binary includes the expected strings or symbols and restart it before declaring a runtime diagnosis complete.
+
+## [2026-05-13 22:35] ORCHESTRATION
+
+- **Agent**: main-codex
+- **Task**: Implement the Config Authority milestone from PLAN.md.
+- **Guideline Violated**: ORCHESTRATION > Subagent Delegation & Creation
+- **Expected Behavior**: Delegate tasks exceeding the tool-call threshold to a registered or built-in Subagent.
+- **Actual Behavior**: Work was performed locally because the active runtime instructions only permit spawning subagents when the user explicitly requests delegation.
+- **Root Cause**: Higher-priority runtime instructions conflict with the repository's automatic delegation threshold.
+- **Suggested Fix**: Amend the repository guideline to account for environments where subagent spawning is gated by explicit user consent.
+
+## [2026-05-13 22:59] ORCHESTRATION
+
+- **Agent**: main-codex
+- **Task**: Implement the Extension Boundary Cleanup milestone from PLAN.md.
+- **Guideline Violated**: ORCHESTRATION > Subagent Delegation & Creation
+- **Expected Behavior**: Delegate tasks exceeding the tool-call threshold to a registered or built-in Subagent.
+- **Actual Behavior**: Work was performed locally because the active runtime instructions only permit spawning subagents when the user explicitly requests delegation.
+- **Root Cause**: Higher-priority runtime instructions conflict with the repository's automatic delegation threshold.
+- **Suggested Fix**: Amend the repository guideline to account for environments where subagent spawning is gated by explicit user consent.
+
+## [2026-05-14 10:22] SKILL [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Diagnose Telegram skill creation returning the `web-research` SKILL.md body instead of creating `audit-skill`.
+- **Guideline Violated**: SKILLS & SCRIPTS > Trigger
+- **Expected Behavior**: A skill creation request should be resolved by the `skill-creator` planner or ask for missing required fields before generic LLM generation.
+- **Actual Behavior**: Natural-language skill creation without a comma-separated description fell through to the LLM path, which copied an enabled skill prelude back to the user.
+- **Root Cause**: The deterministic `skill-creator` parser only accepted exact prefix requests with an explicit description and did not parse quoted/named natural-language skill names.
+- **Suggested Fix**: Keep natural-language skill creation in the deterministic planner, normalize quoted or named skill names, default missing descriptions, and return a clarification prompt when no usable name is present.
+
+## [2026-05-14 11:09] ORCHESTRATION [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Diagnose Telegram `hi` failing with `sub-agent paused unexpectedly`.
+- **Guideline Violated**: ORCHESTRATION > Resolution Chain
+- **Expected Behavior**: General chat should stay in the parent LLM path unless a specialized route explicitly requires delegation.
+- **Actual Behavior**: The configured general fallback delegated unclassified prompts to `general-subagent`, where any approval pause became a fatal child-run error that the gateway could not resume.
+- **Root Cause**: The fallback route used `dispatch = "delegate"` even though sub-agent pauses are not resumable through the current gateway run lifecycle.
+- **Suggested Fix**: Configure general fallback as `dispatch = "direct"` and reserve delegation/escalation for explicit specialized routing rules.
+
+## [2026-05-14 11:40] TOOL [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Fix Telegram skill creation failing with DeepSeek `reasoning_content` thinking-mode error.
+- **Guideline Violated**: GUIDELINES > Correctness
+- **Expected Behavior**: The DeepSeek adapter should preserve provider-required assistant metadata across tool-call turns so multi-turn skill creation can continue after tool execution.
+- **Actual Behavior**: The adapter parsed only assistant `content` and `tool_calls`, dropping `reasoning_content`; the next request after a tool call failed with HTTP 400.
+- **Root Cause**: DeepSeek thinking-mode tool-call responses include `reasoning_content` that must be echoed back in subsequent requests, but AgentOS had no provider-specific preservation path for that field.
+- **Suggested Fix**: Store DeepSeek `reasoning_content` in assistant message metadata, serialize it back on later DeepSeek assistant messages, and retry legacy transcripts with thinking disabled when the provider reports missing passback data.
+
+## [2026-05-14 11:54] TOOL [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Fix Telegram `audit-skill` invocation failing with DeepSeek orphan tool-role message error.
+- **Guideline Violated**: GUIDELINES > Correctness
+- **Expected Behavior**: Provider adapters should serialize only real provider tool results as `tool` role messages, and should pass AgentOS internal observations as ordinary context.
+- **Actual Behavior**: Sub-agent results were stored as AgentOS `Tool` messages without a paired assistant `tool_calls` turn; DeepSeek rejected the transcript because the `tool` role did not answer a preceding provider tool call.
+- **Root Cause**: AgentOS reused `MessageRole::Tool` for both provider tool results and internal observations such as sub-agent results, while OpenAI-compatible providers require strict `assistant.tool_calls` -> `tool` adjacency.
+- **Suggested Fix**: Make OpenAI-compatible provider serializers stateful: preserve paired tool-call/tool-result messages, but downgrade orphan AgentOS `Tool` observations to user-context messages before sending them to the provider.
+
+## [2026-05-14 20:08] TOOL [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Fix Telegram `audit-skill` hanging after shell approval because `find` tripped `ShellCommandAllowlist`.
+- **Guideline Violated**: GUIDELINES > Correctness
+- **Expected Behavior**: Approved shell calls that remain blocked by guardrails should return a clear failed tool result, and skill-documented read-only inspection commands should match the runtime allowlist.
+- **Actual Behavior**: The audit skill instructed optional workspace log search through `shell`, but the runtime shell guardrail did not allow `find`; after approval the guardrail abort surfaced only in logs.
+- **Root Cause**: The runtime allowlist was too narrow for the documented audit workflow, and tool-call guardrail trips were treated as fatal run errors rather than recoverable tool failures.
+- **Suggested Fix**: Centralize the default shell allowlist, include read-only inspection commands such as `find`, and convert preflight tool guardrail trips into failed `ToolResult`s so the model can report or self-correct.
+
+## [2026-05-14 20:45] SKILL [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Audit why `skill-creator` produced only `SKILL.md` instead of a complete skill bundle.
+- **Guideline Violated**: SKILLS & SCRIPTS > Creation
+- **Expected Behavior**: Skill creation should keep the LLM in the generation loop until the requested bundle is complete, and validation should expose enough evidence to verify the bundle inventory.
+- **Actual Behavior**: The deterministic planner ran `skill_validate` immediately after the first `SKILL.md` write and replied on PASS, while the validator only checked `SKILL.md` structure and did not report bundle inventory.
+- **Root Cause**: The workflow conflated structural validation with bundle completeness; `skill-creator` instructions did not require support resources to be written before `SKILL.md`, and the planner ended the turn before the LLM could create additional files.
+- **Suggested Fix**: Make validation output include bundle inventory, return validation PASS to the LLM for final bundle review, and update `skill-creator` instructions to write support files before `SKILL.md` and inspect inventory before final response.
+
+## [2026-05-15 00:31] SKILL [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Fix Telegram `audit-skill` execution failing with `maximum turn count exceeded`.
+- **Guideline Violated**: SKILLS & SCRIPTS > Trigger
+- **Expected Behavior**: Requests for an enabled workspace skill should remain in the parent skill-aware run loop and follow the skill's bounded workflow.
+- **Actual Behavior**: `audit-skill` existed on disk but was not enabled in workspace config; audit prompts could be routed to `research-subagent`, whose generic memory workflow exceeded its turn budget.
+- **Root Cause**: Workspace skill activation and routing were decoupled. The router classified audit wording as research before the parent LLM saw enabled skill instructions, and the audit workflow allowed unrelated fallback reads.
+- **Suggested Fix**: Enable `audit-skill`, bypass LLM routing when user text matches an enabled workspace skill alias, and bound the audit workflow to one audit memory read with immediate failure reporting.
+
+## [2026-05-15 00:54] TOOL [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Fix Telegram `audit-skill` returning `memory scope unauthorized: audit memory requires an administrative path`.
+- **Guideline Violated**: GUIDELINES > Correctness
+- **Expected Behavior**: The documented administrative audit path should allow trusted parent gateway runs to read audit memory while keeping sub-agents and unscoped tool calls restricted.
+- **Actual Behavior**: `MemoryStore::Audit` was rejected unconditionally, so `audit-skill` could only report an authorization failure.
+- **Root Cause**: The memory authorization layer had a placeholder audit denial but no caller capability for administrative read access; tool execution also resolved caller metadata from the assistant tool-call item instead of the originating channel input.
+- **Suggested Fix**: Add a read-only audit capability to `MemoryCaller`, derive it from trusted parent channel metadata, preserve caller identity across tool-call turns, and keep audit access disabled for fallback callers and sub-agent contexts.
+
+## [2026-05-15 12:23] ORCHESTRATION [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Fix Telegram diagnostics request about `audit-skill` files, memory configuration, sessions, and logging failing with sub-agent max turns exceeded.
+- **Guideline Violated**: ORCHESTRATION > Resolution Chain
+- **Expected Behavior**: Workspace diagnostics that require local files, config, sessions, or logs should run in the parent tool-aware path with the appropriate workspace tools.
+- **Actual Behavior**: The router treated `investigate` as research and escalated to `research-subagent`, which only has HTTP/memory access and a four-turn budget, causing `maximum turn count exceeded`.
+- **Root Cause**: Local diagnostic prompts were not distinguished from external research prompts before routing.
+- **Suggested Fix**: Detect workspace diagnostic requests that mention local artifacts and bypass routing delegation so the parent run can use configured workspace tools directly.
+
+## [2026-05-15 13:59] ORCHESTRATION [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Fix Telegram audit-skill rebuild failing with sub-agent maximum turn count exceeded.
+- **Guideline Violated**: ORCHESTRATION > Subagent Delegation & Creation / SKILLS & SCRIPTS > Maintenance
+- **Expected Behavior**: Rebuild requests should route to a clean, bounded implementation path with direct file and skill validation access.
+- **Actual Behavior**: `codereview-subagent` reused unrelated prior child session context, lacked `skill_validate`, could not inspect directories through the file tool, and spent turns on shell calls that guardrails blocked.
+- **Root Cause**: Child conversation IDs were stable per parent conversation and agent, causing cross-task contamination; the code-fix subagent did not include the validator tool; file reads could not list directories; shell guardrail feedback did not clearly direct structured `args` usage.
+- **Suggested Fix**: Fingerprint prompted sub-agent conversations, allow `codereview-subagent` to use `skill_validate`, support bounded directory listings in file reads, improve shell guardrail hints, and rebuild `audit-skill` to use local session/trace/log sources without shell.
+
+## [2026-05-15 14:19] TOOL [RESOLVED]
+
+- **Agent**: main-codex
+- **Task**: Fix Telegram `audit-skill` execution failing with DeepSeek maximum context length error.
+- **Guideline Violated**: GUIDELINES > Correctness / SKILLS & SCRIPTS > Maintenance
+- **Expected Behavior**: Audit workflows should inspect logs and traces through bounded reads and must not inject multi-megabyte tool observations into the next provider request.
+- **Actual Behavior**: `audit-skill` read append-only JSONL/log artifacts directly, including a 10 MB gateway log, and the next DeepSeek request exceeded the model context limit with 2,940,746 message tokens.
+- **Root Cause**: The file tool had no read range/tail controls or default output bound, and the audit skill documented unbounded reads for large operational artifacts.
+- **Suggested Fix**: Add bounded file reads with `max_bytes`, `offset`, and `tail`, cap tool-result transcript content defensively, and require audit-skill to read recent log/JSONL tails instead of full files.
