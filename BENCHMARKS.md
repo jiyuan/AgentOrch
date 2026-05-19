@@ -1,6 +1,6 @@
 # Agent OS Benchmarks
 
-Target loop overhead: ≤ 2 ms per turn excluding LLM and tool latency.
+Target loop overhead: ≤ 2 ms per turn excluding LLM and tool latency. This is the performance budget for the typed run loop described in [`DESIGN.md`](DESIGN.md) and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Current results
 

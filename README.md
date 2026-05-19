@@ -1,11 +1,22 @@
 # AgentOS
 
-AgentOS is a Rust-based local agent runtime with:
+AgentOS is an agent-agnostic Rust agent runtime built around one auditable run
+loop. Every run follows the same typed state machine, and every external
+capability crosses a narrow trait or policy boundary.
 
-- an interactive TUI
-- a persistent gateway for Telegram and Feishu
-- pluggable LLM providers
-- SQLite-backed session and memory storage
+Highlights:
+
+- a typed run loop (`Start → Plan → Approve → Act → Observe`) with serializable
+  paused runs
+- a concrete approval policy plus input/output/tool guardrails
+- pluggable extension traits (`Channel`, `Tool`, `Skill`, `McpClient`,
+  `Memory`, `Session`, `Orchestrator`)
+- sub-agents and routing whose permissions can only narrow the parent's
+- scoped three-layer memory (session, working, long-term) on a SQLite reference
+  backend
+- static and stdio MCP-backed tools, with subprocess isolation for tools marked
+  `requires_isolation`
+- an interactive TUI and a persistent gateway for Telegram and Feishu
 
 ## Quick start
 
@@ -26,6 +37,31 @@ scripts/install-agentos.sh
 ~/.local/bin/agentos tui
 ```
 
+## Architecture overview
+
+AgentOS is layered into an immutable core engine, an agent-owned workspace, and
+swappable extensions. Core crates must never depend on workspace or extension
+content.
+
+- `agentos-proto`: serializable wire and domain types.
+- `agentos-interfaces`: public extension traits and shared run-state types.
+- `agentos-core`: run loop, runner, gateway service, approval engine,
+  guardrails, reference tools, memory/session stores, sub-agent execution,
+  channel adapters, and config parsing.
+- `agentos-llm`: provider-neutral LLM facade and provider adapters.
+- `agentos-cli`: TUI, one-shot channel entry points, persistent gateway, and
+  runtime path construction.
+
+Four independent safety rings protect every run: the type system enumerates
+valid control flow, guardrails inspect content, the concrete `Approve` engine
+allows/denies/pauses boundary actions, and subprocess isolation contains tools
+that request it. Workspace-owned content (`agent.toml`, `skills/`,
+`subagents/`, `suborchs/`, `crons/`, `tasks/`, runtime state) is loaded as data
+through config, never linked as a dependency.
+
+See the [Architecture Design Document](docs/ARCHITECTURE.md) for the full run
+loop model, memory architecture, and extension boundary.
+
 ## Main scripts
 
 - `scripts/install-agentos.sh`: install AgentOS from source or a release bundle
@@ -35,9 +71,11 @@ scripts/install-agentos.sh
 
 ## Documentation
 
-- [Install Guide](/Users/jiyuan/agents/codex/agentos/docs/INSTALL.md)
-- [User Guide](/Users/jiyuan/agents/codex/agentos/docs/USER_GUIDE.md)
-- [Release Notes](/Users/jiyuan/agents/codex/agentos/docs/RELEASE_NOTES.md)
+- [Install Guide](docs/INSTALL.md)
+- [User Guide](docs/USER_GUIDE.md)
+- [Architecture Design Document](docs/ARCHITECTURE.md)
+- [Skills Guide](docs/SKILLS.md)
+- [Release Notes](docs/RELEASE_NOTES.md)
 
 ## Release artifacts
 

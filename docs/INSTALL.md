@@ -42,13 +42,27 @@ After install, copy and edit:
 cp ~/.local/share/agentos/.env.example ~/.local/share/agentos/.env
 ```
 
-Minimum TUI setup:
+Minimum TUI setup (OpenAI):
 
 ```env
 AGENTOS_LLM_PROVIDER=openai
 AGENTOS_LLM_MODEL=gpt-5.4-mini
 OPENAI_API_KEY=...
 ```
+
+Supported LLM providers (`AGENTOS_LLM_PROVIDER`):
+
+| Provider | Required environment | Default model |
+|---|---|---|
+| `openai` | `OPENAI_API_KEY` | `gpt-5.4-mini` |
+| `anthropic` | `ANTHROPIC_API_KEY` | set via `AGENTOS_LLM_MODEL` |
+| `deepseek` | `DEEPSEEK_API_KEY` | set via `AGENTOS_LLM_MODEL` |
+| `ollama` | `OLLAMA_HOST` (defaults to `http://localhost:11434`) | set via `AGENTOS_LLM_MODEL` |
+| `builtin.echo` | none (offline fallback) | `builtin.echo` |
+
+If `AGENTOS_LLM_PROVIDER` is unset, the provider is inferred from whichever
+credential is present, in this order: OpenAI, Anthropic, DeepSeek, Ollama, then
+the `builtin.echo` offline fallback.
 
 Telegram setup:
 

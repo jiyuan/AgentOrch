@@ -18,14 +18,18 @@ agentos tui
 
 Starts the interactive terminal interface.
 
-Useful commands inside the TUI:
+Slash commands inside the TUI (the Telegram and Feishu gateways accept the
+same set):
 
-- `/clear`
-- `/orchestrator status`
-- `/orchestrator max`
-- `/orchestrator min`
-- `/model status`
-- `/model reset`
+- `/help` — list available slash commands.
+- `/clear` — clear the current conversation history.
+- `/orchestrator [max|min|status]` — show or switch the orchestrator strategy.
+- `/model [provider:model|status|reset]` — show, set, or reset the LLM model.
+- `/skills [list|status]` — list enabled workspace skills.
+- `/crons [list|status]` — list scheduled cron tasks.
+- `/tools [list|status]` — list registered tools.
+- `/memory [list|status]` — list scoped memory fragments.
+- `/usage [status]` — show session token usage.
 
 ### Gateway lifecycle
 
@@ -70,6 +74,18 @@ agentos feishu-once
 ```
 
 These process a single inbound event and exit.
+
+### Resuming a paused run
+
+When an action requires approval (`ask_user`), the run is serialized to disk.
+Resume it with:
+
+```sh
+agentos resume [<state-file>]
+```
+
+Without an explicit path, it falls back to
+`~/.local/share/agentos/workspace/runs/cli-run-1.json`.
 
 ## Logs and state
 
