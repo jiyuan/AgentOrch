@@ -1,10 +1,5 @@
-use super::{
-    CronCreatorTool, CronListTool, CronRemoveTool, FileTool, HttpTool, McpTool, MemoryTool,
-    ShellTool, SkillValidateTool,
-};
-use crate::memory::MemoryManager;
+use super::McpTool;
 use agentos_interfaces::mcp::{McpClient, McpError, McpServer};
-use agentos_interfaces::memory::Memory;
 use agentos_interfaces::orchestrator::RunContext;
 use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
 use agentos_proto::{ToolCall, ToolResult};
@@ -36,30 +31,6 @@ impl ToolRegistry {
         Self::default()
     }
 
-    pub fn reference() -> Self {
-        let mut registry = Self::new();
-        registry.register(ShellTool);
-        registry.register(HttpTool);
-        registry.register(FileTool);
-        registry.register(SkillValidateTool);
-        registry.register(CronCreatorTool);
-        registry.register(CronListTool);
-        registry.register(CronRemoveTool);
-        registry
-    }
-
-    pub fn reference_with_memory(memory: Arc<dyn Memory>) -> Self {
-        let mut registry = Self::reference();
-        registry.register(MemoryTool::new(memory));
-        registry
-    }
-
-    pub fn reference_with_memory_manager(memory_manager: Arc<MemoryManager>) -> Self {
-        let mut registry = Self::reference();
-        registry.register(MemoryTool::with_manager(memory_manager));
-        registry
-    }
-
     pub fn register<T>(&mut self, tool: T)
     where
         T: Tool + 'static,
@@ -78,7 +49,21 @@ impl ToolRegistry {
         server: McpServer,
         client: Arc<dyn McpClient>,
     ) -> Result<Vec<ToolSpec>, ToolRegistryError> {
+        self.register_mcp_server_filtered(server, client, |_| true)
+            .await
+    }
+
+    pub async fn register_mcp_server_filtered(
+        &mut self,
+        server: McpServer,
+        client: Arc<dyn McpClient>,
+        enabled: impl Fn(&ToolSpec) -> bool,
+    ) -> Result<Vec<ToolSpec>, ToolRegistryError> {
         let specs = client.list_tools(&server).await?;
+        let specs = specs
+            .into_iter()
+            .filter(|spec| enabled(spec))
+            .collect::<Vec<_>>();
         for spec in specs.iter().cloned() {
             self.register(McpTool::new(server.clone(), Arc::clone(&client), spec));
         }

@@ -1,20 +1,21 @@
 use crate::orchestrator::{SubAgentSpec, SubOrchSpec};
 use crate::session::Transcript;
 use agentos_proto::{
-    AgentId, InterruptionId, RunId, SchemaVersion, TaskId, ToolCall, TraceEvent, TraceSpan, Usage,
+    AgentId, ChannelId, ConversationId, InterruptionId, RunId, SchemaVersion, TaskId, ToolCall,
+    TraceEvent, TraceSpan, Usage,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Interruption {
     pub id: InterruptionId,
     pub action: InterruptionAction,
     pub status: ApprovalStatus,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum InterruptionAction {
     ToolCall(ToolCall),
@@ -23,6 +24,12 @@ pub enum InterruptionAction {
     Handoff {
         agent_id: AgentId,
         payload: Option<Value>,
+    },
+    ResumeSubAgent {
+        spec: SubAgentSpec,
+        child_channel_id: ChannelId,
+        child_conversation_id: ConversationId,
+        child_state: Box<RunState>,
     },
 }
 
@@ -34,7 +41,7 @@ pub enum ApprovalStatus {
     Rejected { reason: Arc<str> },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RunState {
     pub run_id: RunId,
     pub active_agent: AgentId,
@@ -104,7 +111,8 @@ impl RunState {
             InterruptionAction::ToolCall(call) => Some(call),
             InterruptionAction::Delegate(_)
             | InterruptionAction::Escalate(_)
-            | InterruptionAction::Handoff { .. } => None,
+            | InterruptionAction::Handoff { .. }
+            | InterruptionAction::ResumeSubAgent { .. } => None,
         }
     }
 

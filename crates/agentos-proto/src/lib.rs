@@ -15,4 +15,4 @@ pub use ids::{
 pub use message::{Attachment, AttachmentKind, Message, MessageRole};
 pub use tool::{ToolCall, ToolResult, ToolStatus};
 pub use trace::{SpanKind, TraceEvent, TraceSpan};
-pub use usage::Usage;
+pub use usage::{Usage, TOKEN_USAGE_METADATA_KEY};

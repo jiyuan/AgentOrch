@@ -1,5 +1,5 @@
 use crate::providers::content::append_descriptors;
-use crate::providers::post_json;
+use crate::providers::{attach_token_usage, log_token_usage, post_json};
 use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::{Message, MessageRole, ToolCall, ToolCallId};
 use serde_json::{json, value::RawValue, Value};
@@ -40,14 +40,19 @@ pub async fn complete(
         .unwrap_or("")
         .to_owned();
     let tool_calls = parse_tool_calls(message_value);
-    Ok(Message {
+    let token_usage = log_token_usage("ollama", model, &response.body);
+    let mut message = Message {
         role: MessageRole::Assistant,
         content: Arc::from(content),
         attachments: Vec::new(),
         tool_calls,
         tool_call_id: None,
         metadata: Default::default(),
-    })
+    };
+    if let Some(usage) = token_usage {
+        attach_token_usage(&mut message, usage);
+    }
+    Ok(message)
 }
 
 fn tool_to_function(spec: &ToolSpec) -> Value {

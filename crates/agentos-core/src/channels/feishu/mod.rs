@@ -7,10 +7,11 @@ use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
 use serde_json::{json, Value};
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
+use tracing::debug;
 
 mod event;
 mod long_connection;
@@ -75,6 +76,11 @@ impl FeishuChannel {
 
     pub fn with_receive_error_logging(mut self, enabled: bool) -> Self {
         self.log_receive_errors = enabled;
+        self
+    }
+
+    pub fn with_attachments_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.attachments = AttachmentStore::new(root, "feishu");
         self
     }
 
@@ -385,7 +391,17 @@ impl FeishuChannel {
         {
             Ok(parsed) => parsed,
             Err(err) => {
+                // Drop the socket so the next poll dials a fresh endpoint.
                 self.long_connection = None;
+                // Feishu rotates the long connection periodically; the server
+                // sends a Close frame or just drops the TCP/TLS session (which
+                // rustls reports as a missing close_notify). That is expected
+                // lifecycle, not a backend failure — reconnect quietly on the
+                // next poll instead of surfacing it as an error every rotation.
+                if is_expected_disconnect(&err) {
+                    debug!(error = %err, "feishu long connection rotated; reconnecting");
+                    return Ok(None);
+                }
                 return Err(err);
             }
         };
@@ -457,6 +473,21 @@ async fn post_json(url: &str, bearer: Option<&str>, body: &Value) -> Result<Valu
         .map_err(reqwest_to_channel_err)
 }
 
+/// Whether a long-connection read error is just the server recycling the
+/// socket (so the right response is a silent reconnect) rather than a fault
+/// worth logging. Matches the messages produced by [`websocket`] on a server
+/// Close frame, a stream EOF, and rustls' strict close-without-`close_notify`.
+fn is_expected_disconnect(err: &ChannelError) -> bool {
+    let ChannelError::Backend(message) = err;
+    const BENIGN: [&str; 4] = [
+        "Feishu WebSocket closed by server",
+        "Feishu WebSocket stream ended",
+        "close_notify",
+        "peer closed connection",
+    ];
+    BENIGN.iter().any(|needle| message.contains(needle))
+}
+
 fn reqwest_to_channel_err(err: reqwest::Error) -> ChannelError {
     ChannelError::Backend(Arc::from(err.to_string()))
 }
@@ -466,4 +497,38 @@ fn unix_now() -> Result<u64, ChannelError> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn backend(message: &str) -> ChannelError {
+        ChannelError::Backend(Arc::from(message))
+    }
+
+    #[test]
+    fn server_rotation_messages_are_expected_disconnects() {
+        // The exact strings observed in production logs.
+        assert!(is_expected_disconnect(&backend(
+            "Feishu WebSocket closed by server"
+        )));
+        assert!(is_expected_disconnect(&backend(
+            "Feishu WebSocket read failed: IO error: peer closed connection \
+             without sending TLS close_notify"
+        )));
+        assert!(is_expected_disconnect(&backend(
+            "Feishu WebSocket stream ended"
+        )));
+    }
+
+    #[test]
+    fn genuine_faults_are_not_treated_as_disconnects() {
+        assert!(!is_expected_disconnect(&backend(
+            "Feishu event payload JSON parse failed: expected value"
+        )));
+        assert!(!is_expected_disconnect(&backend(
+            "Feishu WebSocket endpoint response missing URL"
+        )));
+    }
 }

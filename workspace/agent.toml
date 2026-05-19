@@ -36,22 +36,15 @@ write = false
 
 [channels.tui]
 enabled = true
-capacity = 64
+mode = "interactive"
 
 [channels.telegram]
 enabled = false
-capacity = 64
 mode = "poll_once"
-bot_token_env = "AGENTOS_TELEGRAM_BOT_TOKEN"
-chat_id_env = "AGENTOS_TELEGRAM_CHAT_ID"
 
 [channels.feishu]
 enabled = false
-capacity = 64
 mode = "long_connection"
-app_id_env = "AGENTOS_FEISHU_APP_ID"
-app_secret_env = "AGENTOS_FEISHU_APP_SECRET"
-chat_id_env = "AGENTOS_FEISHU_ALLOWED_ID"
 
 [isolation]
 worker_path_env = "AGENTOS_TOOL_WORKER_PATH"
@@ -60,19 +53,10 @@ worker_path_env = "AGENTOS_TOOL_WORKER_PATH"
 priority = ["skills", "tools", "mcp", "llm"]
 
 [resources.skills]
-enabled = ["skill-creator", "web-research"]
+enabled = ["skill-creator", "web-research", "audit-skill"]
 
 [resources.tools]
-enabled = [
-  "file",
-  "http",
-  "memory",
-  "shell",
-  "skill_validate",
-  "cron_create",
-  "cron_list",
-  "cron_remove",
-]
+enabled = ["file", "http", "memory", "shell", "skill_validate", "cron_create", "cron_list", "cron_remove"]
 
 [resources.mcp]
 enabled = ["remote_echo"]
@@ -96,14 +80,28 @@ response = "static MCP response"
 
 [[routing.rules]]
 domain = "software_dev"
-description = "Implementation, debugging, refactoring, tests, architecture, code review, and repository maintenance."
+description = "Implementation, debugging, submitted issue fixes, regressions, tests, architecture, code review, and repository maintenance."
 examples = [
   "fix this failing test",
+  "fix the bug described in this issue",
   "implement the orchestrator plan",
   "review the TUI code path",
 ]
 dispatch = "escalate"
 template = "software-dev"
+
+[[routing.rules]]
+domain = "skill_ops"
+description = "Authoring, editing, or rebuilding a skill bundle: modifying a workspace/skills/<name>/SKILL.md or its scripts and then validating the bundle. Distinct from general code fixes."
+examples = [
+  "update the audit skill",
+  "rebuild the audit-skill SKILL.md",
+  "edit the skill-creator skill bundle",
+  "fix the audit skill and revalidate it",
+]
+dispatch = "delegate"
+agent_id = "skill-editor-subagent"
+policy_id = "skill-edit"
 
 [[routing.rules]]
 domain = "content_ops"
@@ -143,6 +141,4 @@ examples = [
   "answer this general question",
   "help me think through this",
 ]
-dispatch = "delegate"
-agent_id = "general-subagent"
-policy_id = "general"
+dispatch = "direct"

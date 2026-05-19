@@ -22,6 +22,12 @@ pub enum Plan {
     Handoff(AgentId, Option<Value>),
     Delegate(SubAgentSpec),
     Escalate(SubOrchSpec),
+    ResumeSubAgent {
+        spec: SubAgentSpec,
+        child_channel_id: agentos_proto::ChannelId,
+        child_conversation_id: agentos_proto::ConversationId,
+        child_state: Box<RunState>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

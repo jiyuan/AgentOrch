@@ -332,6 +332,7 @@ impl MemoryManager {
             conversation_id: episode.conversation_id.clone(),
             user_id: episode.user_id.clone(),
             allowed_shared_domains: Vec::new(),
+            audit_read_access: false,
         };
         let scope = MemoryScope::new(
             MemoryStore::Episodic,
@@ -663,12 +664,7 @@ pub fn memory_caller_from_context(
     ctx: &RunContext<'_>,
     allowed_shared_domains: Vec<Arc<str>>,
 ) -> MemoryCaller {
-    let metadata = ctx
-        .transcript
-        .items
-        .last()
-        .map(|item| &item.metadata)
-        .unwrap_or(&ctx.system.metadata);
+    let metadata = caller_metadata_from_context(ctx);
     let conversation_id = metadata
         .get("conversation_id")
         .and_then(Value::as_str)
@@ -712,5 +708,121 @@ pub fn memory_caller_from_context(
         conversation_id,
         user_id,
         allowed_shared_domains,
+        audit_read_access: audit_read_access_from_context(ctx),
+    }
+}
+
+fn caller_metadata_from_context<'a>(ctx: &'a RunContext<'_>) -> &'a BTreeMap<Arc<str>, Value> {
+    ctx.transcript
+        .items
+        .iter()
+        .rev()
+        .map(|item| &item.metadata)
+        .find(|metadata| {
+            metadata.contains_key("conversation_id")
+                || metadata.contains_key("sender")
+                || metadata.contains_key("user_id")
+                || metadata.contains_key("memory_view")
+        })
+        .unwrap_or_else(|| {
+            ctx.transcript
+                .items
+                .last()
+                .map(|item| &item.metadata)
+                .unwrap_or(&ctx.system.metadata)
+        })
+}
+
+fn audit_read_access_from_context(ctx: &RunContext<'_>) -> bool {
+    let Some(item) = ctx.transcript.items.iter().rev().find(|item| {
+        item.metadata
+            .get("channel_id")
+            .and_then(Value::as_str)
+            .is_some()
+    }) else {
+        return false;
+    };
+    let channel_is_trusted_parent = item
+        .metadata
+        .get("channel_id")
+        .and_then(Value::as_str)
+        .is_some_and(|channel| matches!(channel, "tui" | "telegram" | "feishu"));
+    let not_subagent = item
+        .metadata
+        .get("kind")
+        .and_then(Value::as_str)
+        .is_none_or(|kind| kind != "subagent_input");
+    channel_is_trusted_parent && not_subagent
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentos_interfaces::session::Item;
+    use agentos_interfaces::RunState;
+    use agentos_proto::{AgentId, Message, MessageRole, RunId, TaskId};
+    use serde_json::json;
+
+    #[test]
+    fn memory_caller_uses_parent_channel_metadata_after_tool_call() {
+        let mut state = RunState::new(RunId::new("run-1"), AgentId::new("default"));
+        state.task_id = Some(TaskId::new("task-1"));
+        let mut user_metadata = BTreeMap::new();
+        user_metadata.insert(Arc::from("channel_id"), json!("telegram"));
+        user_metadata.insert(Arc::from("conversation_id"), json!("chat-1"));
+        user_metadata.insert(Arc::from("sender"), json!("user-1"));
+        state.transcript.items.push(Item {
+            message: Message::text(MessageRole::User, "Run an audit"),
+            metadata: user_metadata,
+        });
+        let mut tool_call_metadata = BTreeMap::new();
+        tool_call_metadata.insert(Arc::from("kind"), json!("tool_call"));
+        tool_call_metadata.insert(Arc::from("tool_name"), json!("memory"));
+        state.transcript.items.push(Item {
+            message: Message::text(MessageRole::Assistant, ""),
+            metadata: tool_call_metadata,
+        });
+
+        let ctx = RunContext::from_state(&state);
+        let caller = memory_caller_from_context(&ctx, Vec::new());
+
+        assert_eq!(caller.conversation_id.as_str(), "chat-1");
+        assert_eq!(caller.user_id.as_deref(), Some("user-1"));
+        assert!(caller.audit_read_access);
+    }
+
+    #[tokio::test]
+    async fn audit_store_read_requires_parent_admin_path() {
+        let manager = MemoryManager::new(Arc::new(InMemoryMemory::default()));
+        let scope = MemoryScope::new(
+            MemoryStore::Audit,
+            MemoryOwner::Conversation(ConversationId::new("chat-1")),
+            MemoryVisibility::Private,
+            None,
+        );
+        let query = Query::lexical("", 5);
+        let caller = MemoryCaller {
+            agent_id: AgentId::new("default"),
+            task_id: TaskId::new("task-1"),
+            conversation_id: ConversationId::new("chat-1"),
+            user_id: None,
+            allowed_shared_domains: Vec::new(),
+            audit_read_access: false,
+        };
+        let err = manager
+            .read_scoped(&caller, scope.clone(), &query)
+            .await
+            .expect_err("non-admin audit read should be rejected");
+        assert!(err.to_string().contains("administrative path"));
+
+        let admin_caller = MemoryCaller {
+            audit_read_access: true,
+            ..caller
+        };
+        let records = manager
+            .read_scoped(&admin_caller, scope, &query)
+            .await
+            .expect("admin audit read should be allowed");
+        assert!(records.is_empty());
     }
 }

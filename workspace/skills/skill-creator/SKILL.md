@@ -1,346 +1,108 @@
 ---
 name: skill-creator
-description: Create, update, validate, and package AgentOS workspace skills end-to-end. Use this whenever the user wants to scaffold a new skill, migrate or improve an existing one, optimize a skill description for triggering accuracy, build a distributable .skill bundle, or otherwise work with the SKILL.md folder format. Adapted from the upstream Anthropic skill-creator (https://github.com/anthropics/skills) for the AgentOS runtime.
+description: Create, update, and validate AgentOS workspace skills. Use this skill whenever the user asks to create a skill, improve an existing skill, migrate a workflow into SKILL.md format, tune skill triggering, or fix a skill validation failure.
 ---
 
 # Skill Creator
 
-A skill for creating, improving, and packaging AgentOS workspace skills.
+Use this skill to build AgentOS skills as durable, validated workflow bundles. The LLM is the generator: it interviews, drafts, rewrites, and improves the skill content. AgentOS is the validator: the `skill_validate` tool and `agentos skill validate` CLI command are the source of truth for whether the bundle is structurally acceptable.
 
-At a high level, the loop is:
+Do not report that a skill is complete until validation passes.
 
-- Decide what the skill should do, when it should trigger, and roughly how it should accomplish the task.
-- Write a draft `SKILL.md` and optional bundled resources.
-- Run the skill against a small set of representative prompts and qualitatively review the outputs with the user.
-- Improve the skill in response to the user's feedback.
-- Repeat until the user is satisfied, then package the skill into a distributable `.skill` archive.
+## Runtime Contract
 
-Your job when using this skill is to figure out where the user is in this loop and help them advance through it. Be flexible — if the user says "let's just vibe," skip the formal evaluation steps. If the user already has a draft, jump straight to running and evaluating it.
+1. Capture the user's intent, including the workflow, trigger conditions, inputs, outputs, required tools, edge cases, and success criteria.
+2. Draft the intended bundle shape before writing files: decide whether the skill needs only `SKILL.md` or also `scripts/`, `references/`, or `assets/`.
+3. Write all supporting resource files first with the `file` tool. Write `SKILL.md` last so validation happens after the planned bundle exists.
+4. Generate a complete `workspace/skills/<skill-name>/SKILL.md` with valid frontmatter and useful Markdown instructions that point to any support files you created.
+5. Run `skill_validate` for the skill name.
+6. If validation fails, read the failure reason, revise the generated files, write the fix, and run `skill_validate` again.
+7. If validation passes, inspect the validator's `bundle_inventory`. PASS confirms `SKILL.md` structure only; it does not prove the bundle is complete. If the inventory is missing files required by the user's requested workflow or by `SKILL.md`, write the missing files and run `skill_validate` again.
+8. Repeat the generate -> validate -> inventory-check -> repair loop until validation passes and the bundle inventory matches the intended bundle.
+9. After the bundle is complete, summarize the skill path, every file created, and any recommended test prompts or follow-up improvements.
 
----
+## Skill Shape
 
-## Communicating with the user
-
-Skill creators get used by people across a wide range of familiarity with software jargon. Pay attention to context cues. As a default heuristic:
-
-- "Evaluation", "benchmark", "iteration" — borderline, but generally OK.
-- "JSON", "assertion", "frontmatter" — wait for cues that the user is comfortable with those before using them without explanation.
-
-When in doubt, briefly define a term the first time you use it. Match the user's register.
-
----
-
-## Creating a skill
-
-### Capture intent
-
-Start by understanding what the user wants. The current conversation may already contain the workflow the user wants to capture ("turn this into a skill"). If so, extract the tools used, the sequence of steps, corrections the user made, and the input/output shapes observed. Ask the user to fill in any gaps and to confirm before scaffolding.
-
-Specifically pin down:
-
-1. What should this skill enable the agent to do?
-2. When should it trigger? (What user phrasings / contexts?)
-3. What does the expected output look like?
-4. Are there inputs (files, URLs, structured data) it depends on?
-5. Should we set up test cases? Skills with objectively verifiable outputs (file transforms, data extraction, code generation, fixed workflow steps) benefit from explicit test cases. Skills with subjective outputs (writing style, art) usually don't.
-
-### Interview and research
-
-Proactively ask about edge cases, example inputs, success criteria, and dependencies before writing test prompts. If MCPs are configured (search, docs lookup), use them in parallel to research conventions or similar existing skills.
-
-### Write the SKILL.md
-
-Roles are split so failures are observable and recoverable:
-
-- **You (the LLM) are the generator.** You write the actual contents of `SKILL.md`, scripts, references, assets — using the standard `file` tool, one write per file. No special-purpose "create skill" tool exists.
-- **The `skill_validate` tool is the validator.** After you've written the bundle, you call `skill_validate` with the skill name. It returns either `PASS` with the resolved path, or `FAIL` with a specific reason (missing SKILL.md, malformed frontmatter, folder-name mismatch, empty body, …) and a hint about which file to fix.
-- **You iterate until validation passes.** If `skill_validate` returns `FAIL`, read the reason, use `file` to fix the offending content, and call `skill_validate` again. Do not claim the skill is created until you've seen a `PASS` result this turn.
-
-The loop, in order:
-
-1. Choose a kebab-case `name` and a triggering `description` (see "Description writing" below).
-2. Write `workspace/skills/<name>/SKILL.md` via the `file` tool. The `file` tool auto-creates missing parent directories, so you don't need a separate "make directory" step.
-3. Write any bundled `scripts/<n>.py`, `references/<n>.md`, `assets/<n>.*` via additional `file` calls.
-4. Call `skill_validate` with `{"name": "<name>"}`.
-5. If `PASS`, you're done. If `FAIL`, read the reason, fix it via another `file` write, and re-validate. Repeat until `PASS`.
-
-There is also a deterministic shortcut for the *initial scaffold* only:
+Every AgentOS skill is a directory with:
 
 ```text
-create skill: <skill-name>, <one-line description>
+workspace/skills/<skill-name>/
+  SKILL.md
+  scripts/       optional deterministic helpers
+  references/    optional detailed docs loaded only when needed
+  assets/        optional templates or static assets
 ```
 
-That prefix is intercepted by `SkillCreatorSkill` and emits a single `file` write that lays down a minimal valid `SKILL.md` skeleton (frontmatter + placeholder body). It does **not** write any other bundle files — those still come from your follow-up `file` calls. After the shortcut returns, continue the loop above starting from step 3 and end with `skill_validate`.
-
-### SKILL.md shape (what `skill_validate` checks)
-
-- YAML frontmatter at the very top, opened by `---` on its own line and closed by `---` on its own line.
-- `name:` value equal to the folder name (lowercase, hyphens between words, max 64 chars).
-- `description:` non-empty, max 1024 chars, no `<` or `>` characters.
-- Non-empty Markdown body after the closing `---`.
-
-Optional frontmatter fields the upstream spec allows (and `scripts/quick_validate.py` checks): `license`, `allowed-tools`, `metadata`, `compatibility`. AgentOS itself only reads `name` and `description`; extras are preserved verbatim and ignored by the loader.
-
-#### Example: worked audit-skill loop
-
-For an "audit-skill" that tracks the last 24 hours of model usage:
-
-1. `file` write — `workspace/skills/audit-skill/SKILL.md`:
-
-   ```markdown
-   ---
-   name: audit-skill
-   description: Summarize the last 24h of model token consumption, total model calls, task executions, and task success rate from the AgentOS run-state and trace logs. Use this skill whenever the user asks about model usage, token spend, audit numbers, daily activity stats, or "what did the agent do today".
-   ---
-
-   # Audit Skill
-
-   ## Workflow
-
-   1. Read trace files under `workspace/traces/`.
-   2. Filter spans to the last 24h.
-   3. Aggregate `tokens`, `tool_calls`, `task_id` counts, and success/failure status.
-   4. Emit a Markdown summary with the four metrics.
-
-   See `scripts/aggregate.py` for the reusable aggregator. See `references/trace_shape.md` for the trace span schema.
-   ```
-
-2. `file` write — `workspace/skills/audit-skill/scripts/aggregate.py` (Python implementation).
-3. `file` write — `workspace/skills/audit-skill/references/trace_shape.md` (schema doc).
-4. `skill_validate` with `{"name": "audit-skill"}` → expect `skill_validate: PASS — 'audit-skill' at <abs-path> ...`.
-
-If step 4 returns `FAIL — ... reason: SKILL.md body instructions are required ... hint: SKILL.md needs a non-empty body ...`, that means step 1's body was empty after trimming — rewrite SKILL.md and re-validate.
-
-#### Description writing — leaning toward "pushy"
-
-The description is the *only* signal that decides whether the skill triggers. The model has a tendency to under-trigger skills. Lean the description slightly toward over-triggering: instead of "How to build a fast dashboard for internal data," write "How to build a fast dashboard for internal data. Use this skill whenever the user mentions dashboards, data visualization, internal metrics, or wants to display company data of any kind, even if they don't explicitly say 'dashboard'."
-
-You'll formally optimize this later — see [Description Optimization](#description-optimization).
-
-### Skill anatomy
-
-```
-skill-name/
-├── SKILL.md          # required: YAML frontmatter + body
-├── scripts/          # optional: deterministic, repeatable scripts
-├── references/       # optional: docs the model reads on demand
-├── assets/           # optional: templates, fonts, icons, output collateral
-└── evals/            # optional: evals.json + sample input files
-```
-
-#### Progressive disclosure
-
-Skills load in three tiers:
-
-1. **Metadata** (name + description) — always in context (~100 words).
-2. **SKILL.md body** — in context whenever the skill triggers (target <500 lines).
-3. **Bundled resources** — read on demand (`references/`), executed without reading (`scripts/`), or referenced in outputs (`assets/`).
-
-Patterns that pay off:
-
-- Reference bundled files explicitly from `SKILL.md` with guidance on when to read them.
-- For long reference files (>300 lines), put a short table of contents at the top so the reader can jump.
-- For multi-domain skills, organize by variant in `references/`:
-
-```
-cloud-deploy/
-├── SKILL.md          # workflow + selection logic
-└── references/
-    ├── aws.md
-    ├── gcp.md
-    └── azure.md
-```
-
-The body says "for AWS, read `references/aws.md`" — only the relevant variant gets loaded.
-
-### Writing patterns
-
-Prefer the imperative form. Explain *why* something matters; today's models reason well when you give them theory of mind. Heavy-handed `MUST` and `NEVER` blocks are a yellow flag — usually the underlying reason will steer the model just as effectively and generalize better.
-
-**Output template pattern:**
+`SKILL.md` must start with YAML frontmatter:
 
 ```markdown
-## Report structure
-Use this exact template:
-# [Title]
-## Executive summary
-## Key findings
-## Recommendations
+---
+name: lower-hyphen-name
+description: Clear trigger description explaining when to use the skill.
+---
+
+# Skill Title
+
+Markdown instructions for the reusable workflow.
 ```
 
-**Example pattern:**
+The `name` must match the folder name. The description is the trigger surface; make it specific enough that the model knows when to use the skill, including common phrases and adjacent contexts where the skill should apply.
 
-```markdown
-## Commit message format
-**Example:**
-Input: Added user authentication with JWT tokens
-Output: feat(auth): implement JWT-based authentication
-```
+## Generation Guidance
 
-### Principle of least surprise
+Write skills for repeated use, not just the immediate example. Prefer concise instructions with clear reasoning over rigid command lists. Keep the body focused on the core workflow; move bulky schemas, long examples, or domain references into `references/` and point to them from `SKILL.md`.
 
-Skills must not contain malware, exploit code, or anything that could compromise system security. The skill's behaviour should match what its description promises — no hidden side effects. Decline requests to create misleading skills or skills designed to facilitate unauthorized access. Roleplay-style skills are fine.
+Include these sections when they materially help:
 
-### Test cases
+- `## When To Use`: concrete trigger situations and near-misses.
+- `## Inputs`: arguments, files, URLs, or context the user must provide.
+- `## Workflow`: ordered steps with success criteria.
+- `## Tool Use`: required AgentOS tools or CLI commands.
+- `## Validation`: how to check the skill after edits.
+- `## Examples`: realistic prompts that should trigger the skill.
 
-After the draft, draft 2-3 realistic test prompts — phrasings a real user would actually send. Share them with the user, confirm they're representative, then save to `evals/evals.json`. See `references/schemas.md` for the full schema.
+For deterministic or repetitive work, add a script under `scripts/` and instruct the LLM when to run it. For reference-heavy domains, add targeted files under `references/` and explain when to open each one. For templates, icons, or sample files, use `assets/`.
 
-```json
-{
-  "skill_name": "example-skill",
-  "evals": [
-    {
-      "id": 1,
-      "prompt": "User's task prompt",
-      "expected_output": "Description of expected result",
-      "files": []
-    }
-  ]
-}
-```
+Use these bundle rules:
 
-Don't draft formal assertions yet — write them while the runs are in progress in the next step.
+- Simple judgment or writing workflows may be a single-file bundle with only `SKILL.md`.
+- Deterministic parsing, calculations, audits, report generation, migrations, or checks should include at least one helper under `scripts/`.
+- Workflows with schemas, field mappings, long examples, rubrics, or domain facts should include targeted files under `references/`.
+- Workflows that reuse templates, samples, images, icons, or fixture files should include them under `assets/`.
+- Do not claim that a bundle is complete if `bundle_inventory` lists only `SKILL.md` and the workflow would be more reliable with a script, reference, or asset.
 
----
+## Validation Loop
 
-## Running test cases on AgentOS
+Validation failures are expected feedback, not fatal errors. Treat the validator output as a repair instruction.
 
-The AgentOS runtime does not include the upstream Anthropic eval-viewer server or `claude` CLI subprocess. Run test cases like this:
+If `skill_validate` reports:
 
-1. **Spawn each test prompt as a sub-agent task** if a sub-agent is configured (`agent.toml` / `workspace/subagents/`), or run them inline one at a time. Inline runs are fine for early iteration — the human review step compensates.
-2. **Save outputs** under `workspace/skills/<skill-name>-workspace/iteration-<N>/eval-<ID>/with_skill/outputs/`. The workspace directory is a sibling of the skill directory, not inside it, so it never ships in the `.skill` bundle.
-3. **Capture timing** from sub-agent completion notifications into `timing.json` (`total_tokens`, `duration_ms`). The notification is the only place this data is exposed.
-4. **Grade with assertions.** Write a small grading script under `scripts/` for assertions that can be checked programmatically (string presence, file existence, structural shape). Save per-run results to `grading.json` with fields `text`, `passed`, `evidence` (see `references/schemas.md`).
-5. **Present results to the user inline.** Show prompt + output for each test case. If outputs are files (`.docx`, `.csv`, images), save them to disk and tell the user the path. Ask for feedback: "How does this look? Anything you'd change?"
+- missing frontmatter: rewrite `SKILL.md` with opening and closing `---` delimiters.
+- missing name or description: add valid scalar frontmatter fields.
+- folder/name mismatch: make the frontmatter `name` exactly match the directory.
+- empty body: add real workflow instructions after frontmatter.
+- malformed YAML or unsupported frontmatter: simplify to supported keys and retry.
 
-If the host environment has a browser and you want a visual review, you can write a simple static HTML page that lists prompts + outputs side by side — but don't depend on the upstream `generate_review.py`/`run_loop.py` Python tooling, which targets the Claude Code / Cowork environments specifically.
+Only stop after a `PASS` result, a user cancellation, or repeated failures where you need clarification.
 
----
+After a `PASS`, read the `bundle_inventory` in the validator result. If `SKILL.md` references a support path that is absent from the inventory, write that missing file and validate again. If the user asked for a complete bundle and the inventory contains only `SKILL.md`, either create the support files that make the workflow durable or explicitly explain why this skill is intentionally single-file.
 
-## Improving the skill
+## Evaluation and Improvement
 
-This is the heart of the loop. You've run the test cases, the user reviewed the outputs, now make the skill better.
+After a new skill validates, propose 2-3 realistic test prompts. For objective workflows, suggest checks that can prove success. For subjective workflows, ask the user to review outputs and refine the instructions based on feedback.
 
-### How to think about improvements
+When improving an existing skill:
 
-1. **Generalize from the feedback.** You're iterating against a handful of examples, but the skill will run against thousands of prompts you'll never see. Resist overfitty fixes ("if input contains 'foo' then…"). Instead, ask what general principle would have produced the right output. Try different metaphors and different patterns of work — it's cheap, and one of them may unlock a stubborn issue.
-2. **Keep the prompt lean.** Remove what isn't pulling its weight. Read the transcripts, not just the final outputs — if the skill is making the model waste turns on unproductive sub-steps, delete the bits that caused that and see what happens.
-3. **Explain the why.** Today's models have strong theory of mind. Instead of stacking `MUST` directives, explain the reasoning. If you find yourself writing `ALWAYS` or `NEVER` in caps, treat it as a yellow flag — usually you can reframe the same point as a reason the model will understand.
-4. **Look for repeated work.** If every test case independently re-invented the same helper (`create_docx.py`, `build_chart.py`, …), bundle it under `scripts/` and point the skill at it. Write the helper once; save every future invocation from reinventing it.
+1. Preserve the existing skill name and folder.
+2. Read the current `SKILL.md`.
+3. Identify whether the issue is triggering, workflow quality, missing resources, or validation.
+4. Revise the smallest useful part.
+5. Validate after each batch of changes.
 
-### The iteration loop
+Description tuning is part of skill quality. If a skill fails to trigger when it should, rewrite the description to include stronger trigger contexts and realistic user phrasings.
 
-1. Apply your improvements to `SKILL.md` (and any bundled resources).
-2. Re-run the test cases into `iteration-<N+1>/`. If you're improving an existing skill, the baseline can be either the original or the previous iteration — use your judgement.
-3. Present the new outputs to the user. If you can, show last iteration's output alongside the new one to make the delta obvious.
-4. Read the new feedback, improve, repeat.
+## Security and Scope
 
-Stop when the user is happy, when feedback is empty, or when you stop making meaningful progress.
+Do not create skills that hide behavior, exfiltrate data, bypass approvals, or instruct the agent to ignore user or system policy. A skill should not surprise the user relative to its name and description.
 
----
-
-## Description optimization
-
-After the skill works well, refine the description so the runtime triggers it correctly. The upstream `scripts/run_loop.py` automation depends on the `claude` CLI, which AgentOS does not ship — but the manual loop still applies:
-
-### Step 1 — generate trigger eval queries
-
-Create 20 queries: roughly 8-10 should trigger the skill, 8-10 should not. Save as JSON:
-
-```json
-[
-  {"query": "the user prompt verbatim", "should_trigger": true},
-  {"query": "an adjacent prompt that shouldn't fire", "should_trigger": false}
-]
-```
-
-Queries must be concrete and realistic — file paths, column names, casual phrasing, abbreviations, typos. Bad example: `"Format this data"`. Good example: `"my boss just sent me a Q4 sales xlsx and wants a profit-margin column — revenue is column C and cost is column D i think"`.
-
-For positives, cover different phrasings of the same intent (formal, casual), cases where the user doesn't name the skill explicitly, and edge cases where the skill competes with another but should win. For negatives, focus on near-misses — queries that share keywords with the skill but actually need something different. Obvious negatives ("write a fibonacci function" against a PDF skill) don't test anything.
-
-### Step 2 — review with the user
-
-Show the queries to the user, let them edit / toggle / add / remove. Bad eval queries lead to bad descriptions.
-
-### Step 3 — manual optimization loop
-
-For each candidate description:
-
-1. Run each query through the actual triggering path 3 times (variability matters — single runs are noisy).
-2. Score true-positive rate (positives that triggered) and true-negative rate (negatives that didn't).
-3. Combine: `score = (true_positive_rate + true_negative_rate) / 2`.
-4. Ask the model to propose a better description based on which queries failed and why, with the constraint that name + description remain under the 100-word "always in context" budget.
-
-Run for up to 5 iterations, splitting the eval set 60/40 train/test. Pick the description with the best **test** score, not the best train score — that defends against overfitting to the train split.
-
-### How triggering actually works
-
-Skills appear to the runtime as a `name + description` pair. The runtime only consults a skill for tasks it can't easily handle directly, so trivial one-step queries ("read this PDF") often won't trigger any skill regardless of description quality. Tests should be substantive enough that the model would actually benefit from consulting a skill — simple lookups make poor test cases.
-
----
-
-## Packaging and distribution
-
-Once the skill is in good shape, package it for distribution:
-
-```bash
-python3 scripts/package_skill.py workspace/skills/<skill-name>
-```
-
-This validates the skill, then zips it into `<skill-name>.skill` (a renamed zip). Exclusions: `__pycache__/`, `node_modules/`, `*.pyc`, `.DS_Store`, and the top-level `evals/` directory (test cases stay out of the distribution bundle). The output file is suitable for upload to any host that accepts the Anthropic `.skill` format.
-
-To unpack a `.skill` file someone else shares:
-
-```bash
-unzip <name>.skill -d workspace/skills/
-```
-
----
-
-## CLI utilities
-
-AgentOS ships local commands that complement this skill:
-
-```sh
-agentos skill create <name> <description> --resources=scripts,references,assets
-agentos skill validate <name>
-agentos skill validate --all
-agentos skill list
-```
-
-The Rust validator checks the same SKILL.md shape (frontmatter delimiters, required `name` + `description`, lowercase hyphen-case name, folder name matches `name`, non-empty body). Use `scripts/quick_validate.py` when you want the same checks plus optional-field validation outside the AgentOS process.
-
----
-
-## Updating an existing skill
-
-If the user wants to update rather than create:
-
-- **Preserve the original name.** The skill's directory name and frontmatter `name` field stay unchanged. If they're updating `research-helper`, the packaged output is `research-helper.skill`, never `research-helper-v2.skill`.
-- **Copy to a writeable location before editing** if the installed skill is read-only. Edit in `/tmp/<skill-name>/`, then package from the copy.
-- **If packaging manually**, stage in `/tmp/` first and only move the `.skill` to the final destination after it's clean.
-
----
-
-## Reference files
-
-- `references/schemas.md` — JSON schemas for `evals.json`, `grading.json`, `history.json`, `benchmark.json`, `eval_metadata.json`, `feedback.json`. Useful when you write grading scripts or interoperate with the upstream Anthropic eval tooling.
-- `references/agentos.md` — What differs between this port and the upstream Anthropic skill-creator. Read this when the upstream SKILL.md references a tool or capability that AgentOS does not have.
-
-## Scripts
-
-- `scripts/quick_validate.py` — Validates a SKILL.md folder. Same checks as the Rust validator plus optional-field checks. Exits non-zero on failure for use in pipelines.
-- `scripts/package_skill.py` — Validates then zips a skill folder into a `.skill` archive, excluding build artifacts and test workspaces.
-
----
-
-## The core loop, restated
-
-- Figure out what the skill is about.
-- Draft or edit the skill.
-- Run the skill against representative prompts.
-- With the user, evaluate the outputs.
-- Repeat until the user is satisfied.
-- Package the final skill (`.skill`) and hand it back.
-
-Take your time and think things through. The user's time is the constraint; your thinking time is cheap. Write a draft, look at it with fresh eyes, improve it before showing it.
+Use the minimum necessary tools and resources. Keep generated skills inspectable, portable, and easy to validate.

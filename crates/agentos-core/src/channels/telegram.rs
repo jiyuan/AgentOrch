@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+/// Telegram Bot API origin. Overridable via `AGENTOS_TELEGRAM_API_BASE` so the
+/// channel can be pointed at a local mock during tests.
+const DEFAULT_API_BASE: &str = "https://api.telegram.org";
+
 pub struct TelegramChannel {
     token: Arc<str>,
     id: ChannelId,
@@ -23,16 +27,26 @@ pub struct TelegramChannel {
     file_base: Arc<str>,
 }
 
-const TELEGRAM_DEFAULT_API_BASE: &str = "https://api.telegram.org";
-
 impl TelegramChannel {
     pub fn from_env() -> Result<Self, ChannelError> {
         let token = env::var("AGENTOS_TELEGRAM_BOT_TOKEN")
             .map_err(|_| ChannelError::Backend(Arc::from("missing AGENTOS_TELEGRAM_BOT_TOKEN")))?;
-        let allowed_chat_id = env::var("AGENTOS_TELEGRAM_CHAT_ID").ok().map(Arc::from);
+        // An empty value means "no allowlist" (accept any chat), same as the
+        // variable being unset. Without this, an empty override would make
+        // `parse_update` reject every inbound message.
+        let allowed_chat_id = env::var("AGENTOS_TELEGRAM_CHAT_ID")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .map(Arc::from);
         let api_base = env::var("AGENTOS_TELEGRAM_API_BASE")
-            .unwrap_or_else(|_| TELEGRAM_DEFAULT_API_BASE.to_owned());
-        let file_base = env::var("AGENTOS_TELEGRAM_FILE_BASE").unwrap_or_else(|_| api_base.clone());
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_API_BASE.to_owned());
+        let file_base = env::var("AGENTOS_TELEGRAM_FILE_BASE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| api_base.clone());
         Ok(Self {
             token: Arc::from(token),
             id: ChannelId::new("telegram"),
@@ -63,11 +77,26 @@ impl TelegramChannel {
         format!("{}/file/bot{}/{file_path}", self.file_base, self.token)
     }
 
-    fn fetch_updates(&self) -> Result<Value, ChannelError> {
+    /// Long-poll `getUpdates`. `Ok(None)` means the long poll elapsed with no
+    /// new updates (or curl hit its own deadline waiting on an idle socket) —
+    /// that is the steady state, not a failure, so the caller must not log it.
+    fn fetch_updates(&self) -> Result<Option<Value>, ChannelError> {
         let mut command = Command::new("curl");
-        command.args(["--silent", "--show-error", "--max-time", "35", "-X", "POST"]);
+        // The server long-polls for `LONG_POLL_SECS`; curl's own `--max-time`
+        // is kept comfortably above it so a slow TLS handshake on top of a
+        // full-length poll never trips curl mid-poll and looks like an error.
+        command.args([
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            CURL_MAX_TIME_SECS,
+            "-X",
+            "POST",
+        ]);
         command.arg(self.api_url("getUpdates"));
-        command.args(["-d", "timeout=30"]);
+        command.args(["-d", concat!("timeout=", "25")]);
         if let Some(offset) = self.offset {
             command.args(["-d", &format!("offset={offset}")]);
         }
@@ -76,10 +105,17 @@ impl TelegramChannel {
             .output()
             .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))?;
         if !output.status.success() {
+            // curl exit 28 == operation timed out. An idle long poll legitimately
+            // ends this way; treat it as "no updates" so the receive loop just
+            // polls again instead of logging a backend failure every cycle.
+            if output.status.code() == Some(28) {
+                return Ok(None);
+            }
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(ChannelError::Backend(Arc::from(stderr.trim().to_owned())));
         }
         serde_json::from_slice(&output.stdout)
+            .map(Some)
             .map_err(|err| ChannelError::Backend(Arc::from(err.to_string())))
     }
 
@@ -212,7 +248,9 @@ impl Channel for TelegramChannel {
 
     async fn receive(&mut self) -> Option<Envelope> {
         let response = match self.fetch_updates() {
-            Ok(response) => response,
+            Ok(Some(response)) => response,
+            // Idle long poll: no updates this cycle. Not an error — poll again.
+            Ok(None) => return None,
             Err(err) => {
                 if self.log_receive_errors {
                     eprintln!("telegram getUpdates failed: {err}");
@@ -277,6 +315,11 @@ impl Channel for TelegramChannel {
         Ok(())
     }
 }
+
+/// curl `--max-time` for the `getUpdates` long poll. Must stay well above the
+/// server-side `timeout=25` so a full-length poll plus connect/TLS setup never
+/// trips curl's own deadline and surfaces as a spurious backend error.
+const CURL_MAX_TIME_SECS: &str = "40";
 
 /// Telegram sendMessage hard limit: 4096 characters per message body.
 const TELEGRAM_TEXT_LIMIT: usize = 4096;
@@ -530,10 +573,7 @@ mod tests {
         assert_eq!(desc.kind, AttachmentKind::Document);
         assert_eq!(desc.file_id, "doc-1");
         assert_eq!(desc.name, "report.pdf");
-        assert_eq!(
-            desc.mime.as_deref().map(|m| m.as_ref()),
-            Some("application/pdf")
-        );
+        assert_eq!(desc.mime.as_deref(), Some("application/pdf"));
     }
 
     #[test]

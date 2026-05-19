@@ -91,6 +91,24 @@ pub(super) fn plan_assignment_fields(state: &RunState, plan: &Plan) -> BTreeMap<
                 Value::from(spec.template.stages.len()),
             );
         }
+        Plan::ResumeSubAgent { spec, .. } => {
+            fields.insert(
+                Arc::from("plan_kind"),
+                Value::String("resume_subagent".to_owned()),
+            );
+            fields.insert(
+                Arc::from("target_type"),
+                Value::String("subagent".to_owned()),
+            );
+            fields.insert(
+                Arc::from("subagent_id"),
+                Value::String(spec.agent_id.as_str().to_owned()),
+            );
+            fields.insert(
+                Arc::from("policy_id"),
+                Value::String(spec.policy_id.as_ref().to_owned()),
+            );
+        }
     }
     fields
 }

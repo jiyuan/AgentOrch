@@ -21,7 +21,7 @@ use crate::memory::{Memory, MemoryError, Query, QueryType, Record, Selector};
 use crate::orchestrator::{Orchestrator, OrchestratorError, Plan, RunContext};
 use crate::session::{Item, Session, SessionError, Transcript};
 use crate::skill::{Skill, SkillError, SkillInvocation};
-use crate::tool::{Tool, ToolError, ToolMetadata, ToolSpec};
+use crate::tool::{Tool, ToolError, ToolSpec};
 use agentos_proto::{
     ChannelId, ConversationId, Envelope, Message, MessageRole, Namespace, RecordId, ToolCall,
     ToolCallId, ToolResult, ToolStatus,
@@ -771,6 +771,17 @@ fn clone_plan(plan: &Plan) -> Plan {
         Plan::Handoff(agent_id, payload) => Plan::Handoff(agent_id.clone(), payload.clone()),
         Plan::Delegate(spec) => Plan::Delegate(spec.clone()),
         Plan::Escalate(spec) => Plan::Escalate(spec.clone()),
+        Plan::ResumeSubAgent {
+            spec,
+            child_channel_id,
+            child_conversation_id,
+            child_state,
+        } => Plan::ResumeSubAgent {
+            spec: spec.clone(),
+            child_channel_id: child_channel_id.clone(),
+            child_conversation_id: child_conversation_id.clone(),
+            child_state: Box::new((**child_state).clone()),
+        },
     }
 }
 
@@ -785,13 +796,6 @@ fn ok_tool_result(call_id: ToolCallId, content: impl Into<Arc<str>>) -> ToolResu
         content: content.into(),
         metadata: BTreeMap::new(),
     }
-}
-
-#[allow(dead_code)]
-fn _ergonomics_anchor() {
-    // Silence dead-code warnings for the `ToolMetadata` re-export when only
-    // some of the trait variants are exercised in downstream tests.
-    let _ = ToolMetadata::default;
 }
 
 #[cfg(test)]

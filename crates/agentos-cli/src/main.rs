@@ -1,4 +1,4 @@
-use agentos_cli::slash::{self, Parsed, SlashCommand, SlashContext};
+use agentos_cli::slash::{self, Parsed, SessionUsage, SlashCommand, SlashContext};
 use agentos_core::channels::{feishu::FeishuChannel, telegram::TelegramChannel};
 use agentos_core::crons::{CronSchedule, CronStore, CronTask};
 use agentos_core::gateway::{GatewayRun, GatewayService};
@@ -6,7 +6,7 @@ use agentos_core::memory::{MemoryManager, SqliteStore};
 use agentos_core::runner::{
     delete_paused_run, load_paused_run, save_paused_run, ResumeDecision, RunnerDeps,
 };
-use agentos_core::runtime::{skills_root, AgentRuntime, OrchestratorStrategy, RuntimePaths};
+use agentos_core::runtime::{AgentRuntime, OrchestratorStrategy, RuntimePaths};
 use agentos_core::skills::{
     create_skill, validate_skill_dir, SkillCreation, SkillResourceKind, WorkspaceSkillCatalog,
 };
@@ -33,18 +33,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = env::args().skip(1).collect::<Vec<_>>();
     let agent_config_path = agent_config_path();
+    let runtime_paths = runtime_paths(agent_config_path);
     if args.first().is_some_and(|arg| arg == "skill") {
-        handle_skill_command(&args[1..], &skills_root(&agent_config_path))?;
+        handle_skill_command(&args[1..], &runtime_paths.skills_dir)?;
         return Ok(());
     }
 
-    let runtime = AgentRuntime::build(RuntimePaths {
-        agent_config_path,
-        session_db_path: session_path(),
-        trace_dir: trace_dir_path(),
-    })
-    .await
-    .map_err(io::Error::other)?;
+    let attachments_dir = attachments_dir_path(&workspace_dir(&runtime_paths.agent_config_path));
+    let runtime = AgentRuntime::build(runtime_paths.clone())
+        .await
+        .map_err(io::Error::other)?;
     let deps_scope = runtime.deps_scope();
     let input_guardrails = deps_scope.input_guardrails();
     let output_guardrails = deps_scope.output_guardrails();
@@ -55,7 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let orchestrator_switch = runtime.orchestrator.strategy_handle();
     let model_controller = runtime.model_controller.clone();
 
-    let state_path = state_path(&args);
+    let state_path = state_path(&args, &workspace_dir(&runtime_paths.agent_config_path));
     if args.first().is_some_and(|arg| arg == "resume") {
         let channel = TuiChannel::new(
             ChannelId::new("tui"),
@@ -67,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if args.first().is_some_and(|arg| arg == "telegram-once") {
-        let mut channel = TelegramChannel::from_env()?;
+        let mut channel = TelegramChannel::from_env()?.with_attachments_root(&attachments_dir);
         run_channel_once(
             &mut channel,
             &state_path,
@@ -79,12 +77,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if args.first().is_some_and(|arg| arg == "telegram-cron-smoke") {
-        let channel = TelegramChannel::from_env()?;
+        let channel = TelegramChannel::from_env()?.with_attachments_root(&attachments_dir);
         run_telegram_cron_smoke(&channel, &args, &deps).await?;
         return Ok(());
     }
     if args.first().is_some_and(|arg| arg == "feishu-once") {
-        let mut channel = FeishuChannel::from_env()?;
+        let mut channel = FeishuChannel::from_env()?.with_attachments_root(&attachments_dir);
         run_channel_once(
             &mut channel,
             &state_path,
@@ -96,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if args.first().is_some_and(|arg| arg == "feishu-cron-smoke") {
-        let channel = FeishuChannel::from_env()?;
+        let channel = FeishuChannel::from_env()?.with_attachments_root(&attachments_dir);
         run_feishu_cron_smoke(&channel, &args, &deps).await?;
         return Ok(());
     }
@@ -107,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(orchestrator_switch),
         Some(model_controller),
     );
-    let cron_store = CronStore::new(slash::cron_dir_path());
+    let cron_store = CronStore::new(&runtime_paths.cron_dir);
     let memory_manager = runtime.memory_manager.clone();
     let resources = TuiResources {
         skill_catalog: &runtime.skill_catalog,
@@ -415,6 +413,7 @@ async fn run_tui_loop(
     resources: &TuiResources<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let gateway_service = GatewayService::new(deps, Arc::from(active_agent.as_str()));
+    let session_usage = SessionUsage::new();
     let mut turn = 1_u64;
     loop {
         let mut input = match channel.receive_tui().await {
@@ -437,6 +436,7 @@ async fn run_tui_loop(
                     memory_manager: resources.memory_manager,
                     orchestrator_handle: channel.orchestrator_strategy.as_ref(),
                     model_controller: channel.model_controller.as_ref(),
+                    session_usage: Some(&session_usage),
                     agent_id: active_agent,
                     conversation_id: &channel.conversation_id,
                 };
@@ -463,6 +463,7 @@ async fn run_tui_loop(
 
         match result {
             GatewayRun::Finished { state, .. } => {
+                session_usage.record_run(&state.usage);
                 print_trace(&state);
             }
             GatewayRun::Paused { paused, .. } => {
@@ -490,6 +491,7 @@ async fn run_tui_loop(
                     delete_paused_run(state_path)?;
                     match outcome? {
                         GatewayRun::Finished { state, .. } => {
+                            session_usage.record_run(&state.usage);
                             print_trace(&state);
                         }
                         GatewayRun::Paused { paused, .. } => {
@@ -623,7 +625,7 @@ fn env_flag_enabled(name: &str) -> bool {
     })
 }
 
-fn state_path(args: &[String]) -> PathBuf {
+fn state_path(args: &[String], workspace_dir: &Path) -> PathBuf {
     if args.first().is_some_and(|arg| arg == "resume") {
         if let Some(path) = args.get(1) {
             return PathBuf::from(path);
@@ -631,13 +633,38 @@ fn state_path(args: &[String]) -> PathBuf {
     }
     env::var_os("AGENTOS_RUN_STATE_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("workspace/runs/cli-run-1.json"))
+        .unwrap_or_else(|| workspace_dir.join("runs").join("cli-run-1.json"))
 }
 
-fn trace_dir_path() -> PathBuf {
+fn runtime_paths(agent_config_path: PathBuf) -> RuntimePaths {
+    let workspace_dir = workspace_dir(&agent_config_path);
+    RuntimePaths {
+        agent_config_path,
+        session_db_path: session_path(&workspace_dir),
+        trace_dir: trace_dir_path(&workspace_dir),
+        workspace_root: workspace_root_path(),
+        skills_dir: skills_dir_path(&workspace_dir),
+        cron_dir: cron_dir_path(&workspace_dir),
+    }
+}
+
+fn workspace_dir(agent_config_path: &Path) -> PathBuf {
+    agent_config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf()
+}
+
+fn workspace_root_path() -> PathBuf {
+    env::var_os("AGENTOS_WORKSPACE_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+fn trace_dir_path(workspace_dir: &Path) -> PathBuf {
     env::var_os("AGENTOS_TRACE_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("workspace/traces"))
+        .unwrap_or_else(|| workspace_dir.join("traces"))
 }
 
 fn agent_config_path() -> PathBuf {
@@ -646,10 +673,28 @@ fn agent_config_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("workspace/agent.toml"))
 }
 
-fn session_path() -> PathBuf {
+fn session_path(workspace_dir: &Path) -> PathBuf {
     env::var_os("AGENTOS_SESSION_DB_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("workspace/agentos.sqlite"))
+        .unwrap_or_else(|| workspace_dir.join("agentos.sqlite"))
+}
+
+fn skills_dir_path(workspace_dir: &Path) -> PathBuf {
+    env::var_os("AGENTOS_SKILLS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_dir.join("skills"))
+}
+
+fn cron_dir_path(workspace_dir: &Path) -> PathBuf {
+    env::var_os("AGENTOS_CRON_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_dir.join("crons"))
+}
+
+fn attachments_dir_path(workspace_dir: &Path) -> PathBuf {
+    env::var_os("AGENTOS_ATTACHMENTS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_dir.join("attachments"))
 }
 
 fn count_spans(state: &agentos_interfaces::RunState, kind: SpanKind) -> usize {

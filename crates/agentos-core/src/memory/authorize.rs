@@ -11,6 +11,9 @@ pub(super) fn authorize_scope(
     operation: MemoryOperation,
 ) -> Result<(), MemoryError> {
     if scope.store == MemoryStore::Audit {
+        if caller.audit_read_access && matches!(operation, MemoryOperation::Read) {
+            return Ok(());
+        }
         return Err(unauthorized("audit memory requires an administrative path"));
     }
 

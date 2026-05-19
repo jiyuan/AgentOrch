@@ -18,11 +18,38 @@ use agentos_core::runtime::OrchestratorStrategy;
 use agentos_core::skills::WorkspaceSkillCatalog;
 use agentos_core::tools::ToolRegistry;
 use agentos_llm::{configured_selection_for_tier, LlmModelController, LlmModelTier};
-use agentos_proto::{AgentId, ConversationId, TaskId};
+use agentos_proto::{AgentId, ConversationId, TaskId, Usage};
 use std::env;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// Process-lifetime accumulator of token usage across every run in a session.
+/// Cloneable and shared (`Arc<Mutex<…>>`) so the surface loop can fold each
+/// finished run's `RunState.usage` in while `/usage` reads the running total.
+/// A poisoned lock degrades to dropping the sample / reporting zeros rather
+/// than panicking the loop.
+#[derive(Clone, Default)]
+pub struct SessionUsage {
+    total: Arc<Mutex<Usage>>,
+}
+
+impl SessionUsage {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one finished run's accumulated usage into the session total.
+    pub fn record_run(&self, run: &Usage) {
+        if let Ok(mut guard) = self.total.lock() {
+            guard.merge(run);
+        }
+    }
+
+    pub fn snapshot(&self) -> Usage {
+        self.total.lock().map(|guard| *guard).unwrap_or_default()
+    }
+}
 
 /// One parsed slash command. Variants carry only parsed arguments — never
 /// borrowed runtime state — so callers can route them across surfaces freely.
@@ -39,6 +66,7 @@ pub enum SlashCommand {
     ShowModel,
     ResetModel,
     SetModel(String),
+    ShowUsage,
 }
 
 /// Result of parsing a single line.
@@ -63,6 +91,7 @@ pub struct SlashContext<'a> {
     pub memory_manager: &'a MemoryManager,
     pub orchestrator_handle: Option<&'a Arc<AtomicU8>>,
     pub model_controller: Option<&'a LlmModelController>,
+    pub session_usage: Option<&'a SessionUsage>,
     pub agent_id: &'a AgentId,
     pub conversation_id: &'a ConversationId,
 }
@@ -88,6 +117,9 @@ pub fn parse(input: &str) -> Parsed {
         return parsed;
     }
     if let Some(parsed) = parse_simple_list(trimmed, "/memory", SlashCommand::ListMemory) {
+        return parsed;
+    }
+    if let Some(parsed) = parse_simple_list(trimmed, "/usage", SlashCommand::ShowUsage) {
         return parsed;
     }
     if let Some(parsed) = parse_orchestrator(trimmed) {
@@ -148,19 +180,20 @@ fn parse_model(input: &str) -> Option<Parsed> {
 }
 
 /// `str::strip_prefix` but case-insensitive on ASCII.
+///
+/// Compares the leading bytes directly rather than `split_at`-ing the string:
+/// for a non-ASCII `input` (e.g. a CJK message), `prefix.len()` can land in
+/// the middle of a multi-byte char and `split_at` would panic. When the
+/// prefix matches, every prefix byte is ASCII, so `prefix.len()` is
+/// guaranteed to be a valid char boundary and the slice is safe.
 fn strip_prefix_ascii<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
-    if input.len() < prefix.len() {
+    let input_bytes = input.as_bytes();
+    let prefix_bytes = prefix.as_bytes();
+    if input_bytes.len() < prefix_bytes.len() {
         return None;
     }
-    // `prefix.len()` is a byte count. If it lands inside a multibyte UTF-8
-    // character, `input` cannot start with this ASCII prefix anyway, and
-    // slicing there would panic. Bail out safely.
-    if !input.is_char_boundary(prefix.len()) {
-        return None;
-    }
-    let (head, tail) = input.split_at(prefix.len());
-    if head.eq_ignore_ascii_case(prefix) {
-        Some(tail)
+    if input_bytes[..prefix_bytes.len()].eq_ignore_ascii_case(prefix_bytes) {
+        Some(&input[prefix_bytes.len()..])
     } else {
         None
     }
@@ -187,7 +220,42 @@ pub async fn render(cmd: SlashCommand, ctx: &SlashContext<'_>) -> String {
         SlashCommand::ShowModel => format_model_status(ctx.model_controller),
         SlashCommand::ResetModel => format_model_reset(ctx.model_controller),
         SlashCommand::SetModel(input) => format_model_set(ctx.model_controller, &input),
+        SlashCommand::ShowUsage => format_usage(ctx.session_usage),
     }
+}
+
+/// Render the running session token total: input/output split, the prompt
+/// cache hit/miss/write breakdown, and the number of LLM calls behind it.
+pub fn format_usage(session_usage: Option<&SessionUsage>) -> String {
+    let Some(session_usage) = session_usage else {
+        return "Token usage: unavailable in this mode.".to_owned();
+    };
+    let usage = session_usage.snapshot();
+    if usage.tool_calls == 0 {
+        return "Token usage: no LLM calls recorded in this session yet.".to_owned();
+    }
+    let cached_input = usage.cache_read_tokens;
+    let hit_rate = if usage.input_tokens == 0 {
+        0.0
+    } else {
+        (cached_input as f64 / usage.input_tokens as f64) * 100.0
+    };
+    format!(
+        "Session token usage ({calls} LLM call{plural}):\n  \
+         Input:   {input} tokens\n  \
+         Output:  {output} tokens\n  \
+         Total:   {total} tokens\n  \
+         Cache:   {read} read (hit), {write} write, {miss} miss \
+         ({hit_rate:.1}% of input served from cache)",
+        calls = usage.tool_calls,
+        plural = if usage.tool_calls == 1 { "" } else { "s" },
+        input = usage.input_tokens,
+        output = usage.output_tokens,
+        total = usage.total_tokens,
+        read = usage.cache_read_tokens,
+        write = usage.cache_write_tokens,
+        miss = usage.cache_miss_tokens,
+    )
 }
 
 pub fn format_help() -> String {
@@ -202,15 +270,16 @@ pub fn format_help() -> String {
             "/model [provider:model|status|reset]",
             "Show, override, or clear the LLM model.",
         ),
-        (
-            "/skills [list|status]",
-            "List enabled legacy workspace skills.",
-        ),
+        ("/skills [list|status]", "List enabled workspace skills."),
         ("/crons [list|status]", "List scheduled cron tasks."),
         ("/tools [list|status]", "List registered tools."),
         (
             "/memory [list|status]",
             "List memory records visible to this session.",
+        ),
+        (
+            "/usage [status]",
+            "Show total token usage for this session.",
         ),
     ];
     let name_width = entries
@@ -237,7 +306,7 @@ fn format_clear_unavailable() -> String {
 pub fn format_skills(catalog: &WorkspaceSkillCatalog) -> String {
     if catalog.is_empty() {
         return [
-            "No legacy skills are enabled in this workspace.",
+            "No workspace skills are enabled in this workspace.",
             "Define skills under the configured skills directory and enable them via",
             "`[resources.skills] enabled = [\"<name>\"]` in workspace/agent.toml.",
         ]
@@ -575,18 +644,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_handles_multibyte_utf8_without_panicking() {
-        // Regression: strip_prefix_ascii used a byte-index split_at that
-        // panicked when a non-slash multibyte message (e.g. Chinese) had a
-        // non-char-boundary at the candidate prefix length.
-        assert_eq!(parse("用中文回复一句关于人工智能的话。"), Parsed::NotSlash);
-        assert_eq!(parse("🟢 🟡 🔴 ⚪ 🟣"), Parsed::NotSlash);
-        assert_eq!(parse("привет мир"), Parsed::NotSlash);
-        // Slash command followed by multibyte argument must not panic.
-        assert!(matches!(parse("/skills 用中文"), Parsed::Usage(_)));
-    }
-
-    #[test]
     fn parse_orchestrator_variants() {
         assert_eq!(
             parse("/orchestrator"),
@@ -619,6 +676,58 @@ mod tests {
     }
 
     #[test]
+    fn parse_usage_variants() {
+        assert_eq!(parse("/usage"), Parsed::Cmd(SlashCommand::ShowUsage));
+        assert_eq!(parse("/usage status"), Parsed::Cmd(SlashCommand::ShowUsage));
+        assert_eq!(parse("/USAGE"), Parsed::Cmd(SlashCommand::ShowUsage));
+        assert!(matches!(parse("/usage foo"), Parsed::Usage(_)));
+        assert_eq!(parse("/usagefoo"), Parsed::NotSlash);
+    }
+
+    #[test]
+    fn format_usage_reports_no_calls_until_a_run_completes() {
+        let session = SessionUsage::new();
+        assert_eq!(
+            format_usage(Some(&session)),
+            "Token usage: no LLM calls recorded in this session yet."
+        );
+        assert_eq!(format_usage(None), "Token usage: unavailable in this mode.");
+    }
+
+    #[test]
+    fn format_usage_accumulates_runs_and_reports_cache_hit_rate() {
+        let session = SessionUsage::new();
+        // Two runs, three LLM calls total; 1500 of 2000 input tokens cached.
+        session.record_run(&Usage {
+            input_tokens: 1000,
+            output_tokens: 100,
+            total_tokens: 1100,
+            cache_read_tokens: 800,
+            cache_write_tokens: 0,
+            cache_miss_tokens: 200,
+            tool_calls: 2,
+        });
+        session.record_run(&Usage {
+            input_tokens: 1000,
+            output_tokens: 50,
+            total_tokens: 1050,
+            cache_read_tokens: 700,
+            cache_write_tokens: 0,
+            cache_miss_tokens: 300,
+            tool_calls: 1,
+        });
+        let rendered = format_usage(Some(&session));
+        assert!(rendered.contains("3 LLM calls"), "{rendered}");
+        assert!(rendered.contains("Input:   2000 tokens"), "{rendered}");
+        assert!(rendered.contains("Output:  150 tokens"), "{rendered}");
+        assert!(rendered.contains("Total:   2150 tokens"), "{rendered}");
+        assert!(
+            rendered.contains("1500 read (hit), 0 write, 500 miss (75.0% of input served"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
     fn parse_returns_not_slash_for_plain_text() {
         assert_eq!(parse("hello there"), Parsed::NotSlash);
         assert_eq!(parse(""), Parsed::NotSlash);
@@ -628,5 +737,26 @@ mod tests {
     fn parse_does_not_swallow_lookalike_commands() {
         // /skillsfoo isn't /skills with an arg.
         assert_eq!(parse("/skillsfoo"), Parsed::NotSlash);
+    }
+
+    #[test]
+    fn parse_handles_non_ascii_without_panicking() {
+        // Regression: `strip_prefix_ascii` used `split_at(prefix.len())`,
+        // which panicked when a multi-byte char straddled that byte index
+        // (e.g. a Korean/Greek message), crashing the gateway loop.
+        assert_eq!(
+            parse("인공지능의 장점을 한 문장으로 답해 주세요."),
+            Parsed::NotSlash
+        );
+        assert_eq!(
+            parse("Απάντησε με μία πρόταση για τη χρησιμότητα."),
+            Parsed::NotSlash
+        );
+        assert_eq!(parse("日本語のメッセージ"), Parsed::NotSlash);
+        // A real command with a non-ASCII argument still parses.
+        assert_eq!(
+            strip_prefix_ascii("/skills 日本語", "/skills "),
+            Some("日本語")
+        );
     }
 }

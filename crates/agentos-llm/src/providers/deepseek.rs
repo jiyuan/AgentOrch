@@ -1,10 +1,13 @@
 use crate::providers::content::append_descriptors;
-use crate::providers::{format_provider_error, post_json};
+use crate::providers::{attach_token_usage, format_provider_error, log_token_usage, post_json};
 use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::{Message, MessageRole, ToolCall, ToolCallId};
 use serde_json::{json, value::RawValue, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::sync::Arc;
+
+const REASONING_CONTENT_METADATA_KEY: &str = "deepseek.reasoning_content";
 
 pub async fn complete(
     model: &str,
@@ -17,7 +20,7 @@ pub async fn complete(
         .or_else(|_| env::var("DEEPSEEK_BASE_URL"))
         .or_else(|_| env::var("DEEPSEEK_HOST"))
         .unwrap_or_else(|_| "https://api.deepseek.com".to_owned());
-    let serialized = messages.iter().map(flat_message).collect::<Vec<_>>();
+    let serialized = serialize_messages(messages);
     let mut payload = json!({
         "model": model,
         "messages": serialized,
@@ -27,19 +30,24 @@ pub async fn complete(
         // DeepSeek follows OpenAI's Chat Completions shape for function tools.
         payload["tools"] = json!(tools.iter().map(tool_to_function).collect::<Vec<_>>());
     }
-    let response = post_json(
-        "llm",
-        &format!("{}/chat/completions", base_url.trim_end_matches('/')),
-        &[
-            ("Authorization", format!("Bearer {api_key}")),
-            ("Content-Type", "application/json".to_owned()),
-        ],
-        &payload,
-    )
-    .await?;
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let headers = [
+        ("Authorization", format!("Bearer {api_key}")),
+        ("Content-Type", "application/json".to_owned()),
+    ];
+    let mut response = post_json("llm", &url, &headers, &payload).await?;
+    if response
+        .body
+        .get("error")
+        .is_some_and(is_reasoning_content_passback_error)
+    {
+        payload["thinking"] = json!({ "type": "disabled" });
+        response = post_json("llm", &url, &headers, &payload).await?;
+    }
     if let Some(error) = response.body.get("error") {
         return Err(format_provider_error("DeepSeek", &response, error));
     }
+    let token_usage = log_token_usage("deepseek", model, &response.body);
     let message = response
         .body
         .get("choices")
@@ -52,20 +60,35 @@ pub async fn complete(
                 response.body
             )
         })?;
+    let mut message = assistant_message_from_value(message);
+    if let Some(usage) = token_usage {
+        attach_token_usage(&mut message, usage);
+    }
+    Ok(message)
+}
+
+fn assistant_message_from_value(message: &Value) -> Message {
     let content = message
         .get("content")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
     let tool_calls = parse_tool_calls(message);
-    Ok(Message {
+    let mut metadata = BTreeMap::new();
+    if let Some(reasoning_content) = message.get("reasoning_content").and_then(Value::as_str) {
+        metadata.insert(
+            Arc::from(REASONING_CONTENT_METADATA_KEY),
+            Value::String(reasoning_content.to_owned()),
+        );
+    }
+    Message {
         role: MessageRole::Assistant,
         content: Arc::from(content),
         attachments: Vec::new(),
         tool_calls,
         tool_call_id: None,
-        metadata: Default::default(),
-    })
+        metadata,
+    }
 }
 
 fn tool_to_function(spec: &ToolSpec) -> Value {
@@ -138,11 +161,13 @@ fn flat_message(message: &Message) -> Value {
         } else {
             Value::String(message.content.to_string())
         };
-        return json!({
+        let mut serialized = json!({
             "role": "assistant",
             "content": content,
             "tool_calls": calls,
         });
+        append_reasoning_content(message, &mut serialized);
+        return serialized;
     }
     let role = match message.role {
         MessageRole::Assistant => "assistant",
@@ -152,5 +177,240 @@ fn flat_message(message: &Message) -> Value {
     };
     let base = message.content.to_string();
     let content = append_descriptors(&base, &message.attachments);
-    json!({ "role": role, "content": content })
+    let mut serialized = json!({ "role": role, "content": content });
+    append_reasoning_content(message, &mut serialized);
+    serialized
+}
+
+fn serialize_messages(messages: &[Message]) -> Vec<Value> {
+    let mut pending_tool_call_ids = BTreeSet::new();
+    let mut serialized = Vec::with_capacity(messages.len());
+    for message in messages {
+        match message.role {
+            MessageRole::Assistant if !message.tool_calls.is_empty() => {
+                pending_tool_call_ids.clear();
+                pending_tool_call_ids.extend(
+                    message
+                        .tool_calls
+                        .iter()
+                        .map(|call| call.id.as_str().to_owned()),
+                );
+                serialized.push(flat_message(message));
+            }
+            MessageRole::Tool => {
+                let paired = message
+                    .tool_call_id
+                    .as_ref()
+                    .is_some_and(|id| pending_tool_call_ids.remove(id.as_str()));
+                if paired {
+                    serialized.push(flat_message(message));
+                } else {
+                    pending_tool_call_ids.clear();
+                    serialized.push(orphan_tool_message_as_user(message));
+                }
+            }
+            _ => {
+                pending_tool_call_ids.clear();
+                serialized.push(flat_message(message));
+            }
+        }
+    }
+    serialized
+}
+
+fn orphan_tool_message_as_user(message: &Message) -> Value {
+    let kind = message
+        .metadata
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("tool_result");
+    let content = format!(
+        "Internal AgentOS observation ({kind}):\n{}",
+        message.content.as_ref()
+    );
+    json!({ "role": "user", "content": content })
+}
+
+fn append_reasoning_content(message: &Message, serialized: &mut Value) {
+    if message.role != MessageRole::Assistant {
+        return;
+    }
+    let Some(reasoning_content) = message
+        .metadata
+        .get(REASONING_CONTENT_METADATA_KEY)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    serialized["reasoning_content"] = Value::String(reasoning_content.to_owned());
+}
+
+fn is_reasoning_content_passback_error(error: &Value) -> bool {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    message.contains("reasoning_content") && message.contains("must be passed back")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn raw_args(s: &str) -> Box<RawValue> {
+        RawValue::from_string(s.to_owned()).unwrap()
+    }
+
+    #[test]
+    fn assistant_response_preserves_reasoning_content_metadata() {
+        let response = json!({
+            "content": "I will create the skill.",
+            "reasoning_content": "plan the tool call",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "skill_create",
+                    "arguments": "{\"name\":\"audit-skill\"}"
+                }
+            }]
+        });
+
+        let message = assistant_message_from_value(&response);
+
+        assert_eq!(message.content.as_ref(), "I will create the skill.");
+        assert_eq!(message.tool_calls.len(), 1);
+        assert_eq!(message.tool_calls[0].name.as_ref(), "skill_create");
+        assert_eq!(
+            message
+                .metadata
+                .get(REASONING_CONTENT_METADATA_KEY)
+                .and_then(Value::as_str),
+            Some("plan the tool call")
+        );
+    }
+
+    #[test]
+    fn assistant_tool_call_request_echoes_reasoning_content() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            Arc::from(REASONING_CONTENT_METADATA_KEY),
+            Value::String("reason through tool selection".to_owned()),
+        );
+        let message = Message {
+            role: MessageRole::Assistant,
+            content: Arc::from(""),
+            attachments: Vec::new(),
+            tool_calls: vec![ToolCall {
+                id: ToolCallId::new("call_1"),
+                name: Arc::from("skill_create"),
+                args: raw_args(r#"{"name":"audit-skill"}"#),
+            }],
+            tool_call_id: None,
+            metadata,
+        };
+
+        let serialized = flat_message(&message);
+
+        assert_eq!(serialized["role"], "assistant");
+        assert_eq!(serialized["content"], Value::Null);
+        assert_eq!(
+            serialized["reasoning_content"],
+            "reason through tool selection"
+        );
+        assert_eq!(
+            serialized["tool_calls"][0]["function"]["name"],
+            "skill_create"
+        );
+    }
+
+    #[test]
+    fn non_assistant_request_does_not_emit_reasoning_content() {
+        let mut message = Message::text(MessageRole::User, "create a skill");
+        message.metadata.insert(
+            Arc::from(REASONING_CONTENT_METADATA_KEY),
+            Value::String("should not leak".to_owned()),
+        );
+
+        let serialized = flat_message(&message);
+
+        assert!(serialized.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn detects_reasoning_content_passback_errors() {
+        let error = json!({
+            "code": "invalid_request_error",
+            "message": "The `reasoning_content` in the thinking mode must be passed back to the API.",
+            "type": "invalid_request_error"
+        });
+
+        assert!(is_reasoning_content_passback_error(&error));
+        assert!(!is_reasoning_content_passback_error(&json!({
+            "message": "missing API key"
+        })));
+    }
+
+    #[test]
+    fn paired_tool_result_stays_tool_role() {
+        let call = ToolCall {
+            id: ToolCallId::new("call_1"),
+            name: Arc::from("skill_create"),
+            args: raw_args(r#"{"name":"audit-skill"}"#),
+        };
+        let messages = vec![
+            Message {
+                role: MessageRole::Assistant,
+                content: Arc::from(""),
+                attachments: Vec::new(),
+                tool_calls: vec![call],
+                tool_call_id: None,
+                metadata: BTreeMap::new(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: Arc::from("created audit-skill"),
+                attachments: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some(ToolCallId::new("call_1")),
+                metadata: BTreeMap::new(),
+            },
+        ];
+
+        let serialized = serialize_messages(&messages);
+
+        assert_eq!(serialized[0]["role"], "assistant");
+        assert_eq!(serialized[1]["role"], "tool");
+        assert_eq!(serialized[1]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn orphan_tool_result_becomes_user_context() {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(
+            Arc::from("kind"),
+            Value::String("subagent_result".to_owned()),
+        );
+        let messages = vec![
+            Message::text(MessageRole::User, "call audit-skill"),
+            Message {
+                role: MessageRole::Tool,
+                content: Arc::from("audit-skill completed"),
+                attachments: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                metadata,
+            },
+        ];
+
+        let serialized = serialize_messages(&messages);
+
+        assert_eq!(serialized[0]["role"], "user");
+        assert_eq!(serialized[1]["role"], "user");
+        let content = serialized[1]["content"].as_str().unwrap();
+        assert!(content.contains("Internal AgentOS observation (subagent_result)"));
+        assert!(content.contains("audit-skill completed"));
+        assert!(serialized[1].get("tool_call_id").is_none());
+    }
 }

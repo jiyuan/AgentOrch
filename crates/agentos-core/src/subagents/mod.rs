@@ -1,7 +1,9 @@
 use crate::approve::{Policy, PolicyError};
 use crate::memory::{InMemorySession, MemoryManager};
 use crate::r#loop::{InputGuardrailEntry, OutputGuardrailEntry, ToolGuardrailEntry};
-use crate::runner::{run_envelope, RunOutcome, RunnerDeps, TraceSink};
+use crate::runner::{
+    resume_run, run_envelope, PausedRun, ResumeDecision, RunOutcome, RunnerDeps, TraceSink,
+};
 use crate::task_workspace::TaskWorkspace;
 use crate::tools::ToolRegistry;
 use agentos_interfaces::guardrail::{InputGuardrail, OutputGuardrail, ToolGuardrail};
@@ -140,6 +142,21 @@ pub struct SubAgentRunOutput {
     pub message: Message,
 }
 
+#[derive(Debug)]
+pub struct SubAgentPausedRun {
+    pub agent_id: AgentId,
+    pub policy_id: Arc<str>,
+    pub channel_id: ChannelId,
+    pub conversation_id: ConversationId,
+    pub state: agentos_interfaces::RunState,
+}
+
+#[derive(Debug)]
+pub enum SubAgentRun {
+    Finished(SubAgentRunOutput),
+    Paused(SubAgentPausedRun),
+}
+
 pub struct SubAgentInvocation {
     definition: Arc<SubAgentDefinition>,
     policy: Policy,
@@ -240,7 +257,7 @@ impl SubAgentRegistry {
 }
 
 impl SubAgentInvocation {
-    pub async fn run(self) -> Result<SubAgentRunOutput, SubAgentError> {
+    pub async fn run(self) -> Result<SubAgentRun, SubAgentError> {
         let (input_tx, mut input_rx) = mpsc::channel(self.channel_capacity);
         let (output_tx, mut output_rx) = mpsc::channel(self.channel_capacity);
 
@@ -274,6 +291,8 @@ impl SubAgentInvocation {
                 (None, Some(ephemeral)) => ephemeral,
                 _ => unreachable!("either injected or fallback session is set"),
             };
+            let child_channel_id = input.channel_id.clone();
+            let child_conversation_id = input.conversation_id.clone();
             let input_guardrails = definition
                 .input_guardrails
                 .iter()
@@ -315,13 +334,21 @@ impl SubAgentInvocation {
                 tool_guardrails: &tool_guardrails,
             };
             let result = match run_envelope(input, run_id, &deps).await {
-                Ok(RunOutcome::Finished { state, output }) => Ok(SubAgentRunOutput {
+                Ok(RunOutcome::Finished { state, output }) => {
+                    Ok(SubAgentRun::Finished(SubAgentRunOutput {
+                        agent_id: definition.agent_id.clone(),
+                        policy_id: Arc::clone(&definition.policy_id),
+                        state,
+                        message: output.message,
+                    }))
+                }
+                Ok(RunOutcome::Paused(state)) => Ok(SubAgentRun::Paused(SubAgentPausedRun {
                     agent_id: definition.agent_id.clone(),
                     policy_id: Arc::clone(&definition.policy_id),
+                    channel_id: child_channel_id,
+                    conversation_id: child_conversation_id,
                     state,
-                    message: output.message,
-                }),
-                Ok(RunOutcome::Paused(_)) => Err(SubAgentError::Paused),
+                })),
                 Err(err) => Err(SubAgentError::Run(Arc::from(err.to_string()))),
             };
             output_tx
@@ -337,6 +364,102 @@ impl SubAgentInvocation {
                     .await
                     .map_err(|err| SubAgentError::Task(Arc::from(err.to_string())))??;
                 output
+            })
+            .await
+    }
+
+    pub async fn resume(
+        self,
+        paused: SubAgentPausedRun,
+        decision: ResumeDecision,
+    ) -> Result<SubAgentRun, SubAgentError> {
+        let definition = self.definition;
+        let child_policy = self.policy;
+        let trace_sink = self.trace_sink;
+        let task_workspace = self.task_workspace;
+        let injected_session = self.session;
+        let child_approval_id = paused
+            .state
+            .pending_approvals
+            .first()
+            .map(|approval| approval.id.clone())
+            .ok_or_else(|| SubAgentError::Run(Arc::from("paused child has no pending approval")))?;
+        let local = LocalSet::new();
+        local
+            .run_until(async move {
+                let fallback_session = if injected_session.is_none() {
+                    Some(InMemorySession::default())
+                } else {
+                    None
+                };
+                let session: &dyn Session = match (&injected_session, &fallback_session) {
+                    (Some(persistent), _) => persistent.as_ref(),
+                    (None, Some(ephemeral)) => ephemeral,
+                    _ => unreachable!("either injected or fallback session is set"),
+                };
+                let input_guardrails = definition
+                    .input_guardrails
+                    .iter()
+                    .map(|entry| InputGuardrailEntry {
+                        name: Arc::clone(&entry.name),
+                        guardrail: entry.guardrail.as_ref(),
+                    })
+                    .collect::<Vec<_>>();
+                let output_guardrails = definition
+                    .output_guardrails
+                    .iter()
+                    .map(|entry| OutputGuardrailEntry {
+                        name: Arc::clone(&entry.name),
+                        guardrail: entry.guardrail.as_ref(),
+                    })
+                    .collect::<Vec<_>>();
+                let tool_guardrails = definition
+                    .tool_guardrails
+                    .iter()
+                    .map(|entry| ToolGuardrailEntry {
+                        name: Arc::clone(&entry.name),
+                        guardrail: entry.guardrail.as_ref(),
+                    })
+                    .collect::<Vec<_>>();
+                let deps = RunnerDeps {
+                    orchestrator: definition.orchestrator.as_ref(),
+                    session,
+                    memory_manager: definition.memory_manager.as_deref(),
+                    hooks: None,
+                    max_turns: definition.max_turns,
+                    active_agent: definition.agent_id.clone(),
+                    tools: definition.tools.as_deref(),
+                    trace_sink: trace_sink.as_deref(),
+                    task_workspace: task_workspace.as_deref(),
+                    policy: &child_policy,
+                    subagents: None,
+                    input_guardrails: &input_guardrails,
+                    output_guardrails: &output_guardrails,
+                    tool_guardrails: &tool_guardrails,
+                };
+                let paused_run = PausedRun {
+                    channel_id: paused.channel_id.clone(),
+                    conversation_id: paused.conversation_id.clone(),
+                    state: paused.state,
+                };
+                match resume_run(paused_run, &child_approval_id, decision, &deps).await {
+                    Ok(RunOutcome::Finished { state, output }) => {
+                        Ok(SubAgentRun::Finished(SubAgentRunOutput {
+                            agent_id: definition.agent_id.clone(),
+                            policy_id: Arc::clone(&definition.policy_id),
+                            state,
+                            message: output.message,
+                        }))
+                    }
+                    Ok(RunOutcome::Paused(state)) => Ok(SubAgentRun::Paused(SubAgentPausedRun {
+                        agent_id: definition.agent_id.clone(),
+                        policy_id: Arc::clone(&definition.policy_id),
+                        channel_id: paused.channel_id,
+                        conversation_id: paused.conversation_id,
+                        state,
+                    })),
+                    Err(err) => Err(SubAgentError::Run(Arc::from(err.to_string()))),
+                }
             })
             .await
     }
@@ -388,17 +511,32 @@ pub fn child_input_envelope(
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| parent_state.run_id.as_str().to_owned());
 
+    let conversation_suffix = prompt
+        .filter(|prompt| !prompt.trim().is_empty())
+        .map(|prompt| format!(":{}", prompt_fingerprint(prompt)))
+        .unwrap_or_default();
+
     Envelope {
         channel_id: ChannelId::new(format!("subagent:{}", spec.agent_id.as_str())),
         conversation_id: ConversationId::new(format!(
-            "{}:{}",
+            "{}:{}{}",
             parent_conversation_id,
-            spec.agent_id.as_str()
+            spec.agent_id.as_str(),
+            conversation_suffix
         )),
         sender: Arc::from(parent_state.active_agent.as_str()),
         message,
         metadata,
     }
+}
+
+fn prompt_fingerprint(prompt: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in prompt.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 pub fn child_run_id(spec: &SubAgentSpec, parent_state: &agentos_interfaces::RunState) -> RunId {
@@ -502,7 +640,10 @@ mod tests {
         let parent = parent_state_with_user_message();
         let spec = spec_with_prompt("hi");
         let envelope = child_input_envelope(&spec, &parent);
-        assert_eq!(envelope.conversation_id.as_str(), "tg-12345:worker");
+        assert_eq!(
+            envelope.conversation_id.as_str(),
+            "tg-12345:worker:08ba5f07b55ec3da"
+        );
     }
 
     #[test]
@@ -513,6 +654,15 @@ mod tests {
         let env1 = child_input_envelope(&spec, &turn1);
         let env2 = child_input_envelope(&spec, &turn2);
         assert_eq!(env1.conversation_id, env2.conversation_id);
+    }
+
+    #[test]
+    fn child_envelope_conv_id_separates_distinct_prompts() {
+        let parent = parent_state_with_user_message();
+        let first = child_input_envelope(&spec_with_prompt("fix audit skill"), &parent);
+        let second = child_input_envelope(&spec_with_prompt("stop the approve"), &parent);
+
+        assert_ne!(first.conversation_id, second.conversation_id);
     }
 
     #[test]
@@ -527,6 +677,9 @@ mod tests {
         });
         let spec = spec_with_prompt("hi");
         let envelope = child_input_envelope(&spec, &parent);
-        assert_eq!(envelope.conversation_id.as_str(), "parent-run:worker");
+        assert_eq!(
+            envelope.conversation_id.as_str(),
+            "parent-run:worker:08ba5f07b55ec3da"
+        );
     }
 }

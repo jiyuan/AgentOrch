@@ -159,7 +159,7 @@ pub fn approval_prompt_envelope(paused: &PausedRun, sender: Arc<str>) -> Option<
         Arc::from("action_label"),
         Value::String(action_label.clone()),
     );
-    if let InterruptionAction::ToolCall(call) = &approval.action {
+    if let Some(call) = approval_tool_call(&approval.action) {
         metadata.insert(
             Arc::from("tool_name"),
             Value::String(call.name.as_ref().to_owned()),
@@ -199,6 +199,40 @@ fn approval_action_label(action: &InterruptionAction) -> (&'static str, String) 
             format!("{} ({})", spec.template.name, spec.task_id.as_str()),
         ),
         InterruptionAction::Handoff { agent_id, .. } => ("handoff", agent_id.as_str().to_owned()),
+        InterruptionAction::ResumeSubAgent {
+            spec, child_state, ..
+        } => {
+            let child_label = child_state
+                .pending_approvals
+                .first()
+                .map(|approval| {
+                    let (kind, label) = approval_action_label(&approval.action);
+                    format!("{kind} '{label}'")
+                })
+                .unwrap_or_else(|| "unknown child approval".to_owned());
+            (
+                "subagent",
+                format!(
+                    "{} ({}) waiting on {}",
+                    spec.agent_id.as_str(),
+                    spec.policy_id,
+                    child_label
+                ),
+            )
+        }
+    }
+}
+
+fn approval_tool_call(action: &InterruptionAction) -> Option<&agentos_proto::ToolCall> {
+    match action {
+        InterruptionAction::ToolCall(call) => Some(call),
+        InterruptionAction::ResumeSubAgent { child_state, .. } => child_state
+            .pending_approvals
+            .first()
+            .and_then(|approval| approval_tool_call(&approval.action)),
+        InterruptionAction::Delegate(_)
+        | InterruptionAction::Escalate(_)
+        | InterruptionAction::Handoff { .. } => None,
     }
 }
 
@@ -582,4 +616,450 @@ fn record_run_finish(state: &mut RunState, hooks: Option<&Hooks>) {
         active_agent = state.active_agent.as_str(),
         "run_finished"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::approve::{Policy, PolicyAction, PolicyRule, PolicyVerb};
+    use crate::memory::InMemorySession;
+    use crate::r#loop::ToolGuardrailEntry;
+    use crate::subagents::{SubAgentDefinition, SubAgentRegistry};
+    use crate::tools::ToolRegistry;
+    use agentos_interfaces::guardrail::{GuardrailError, GuardrailOutcome, ToolGuardrail};
+    use agentos_interfaces::orchestrator::{OrchestratorError, Plan, RunContext, SubAgentSpec};
+    use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
+    use agentos_interfaces::{InterruptionAction, Orchestrator};
+    use agentos_proto::{
+        AgentId, ConversationId, MessageRole, ToolCall, ToolCallId, ToolResult, ToolStatus,
+    };
+    use async_trait::async_trait;
+    use serde_json::{json, value::RawValue};
+
+    #[tokio::test]
+    async fn paused_subagent_tool_approval_resumes_child_and_parent() {
+        let session = Arc::new(InMemorySession::default());
+        let child_orchestrator = Arc::new(ChildApprovalOrchestrator);
+        let parent_orchestrator = ParentDelegateOrchestrator;
+        let mut registry = SubAgentRegistry::new().with_session(session.clone());
+        let mut tools = ToolRegistry::new();
+        tools.register(MockApprovalTool);
+        let tools = Arc::new(tools);
+        registry.register(
+            SubAgentDefinition::new(
+                AgentId::new("child"),
+                "child-policy",
+                child_orchestrator,
+                Policy::ask_user_tools(["mock"]),
+            )
+            .with_tools(tools)
+            .with_max_turns(4),
+        );
+        let parent_policy = Policy {
+            rules: vec![
+                PolicyRule {
+                    action: PolicyAction::Delegate,
+                    decision: PolicyVerb::Allow,
+                    reason: None,
+                    arg_equals: BTreeMap::new(),
+                },
+                PolicyRule {
+                    action: PolicyAction::Tool(Arc::from("mock")),
+                    decision: PolicyVerb::AskUser,
+                    reason: Some(Arc::from("mock requires approval")),
+                    arg_equals: BTreeMap::new(),
+                },
+            ],
+            default_decision: PolicyVerb::Deny,
+        };
+        let deps = RunnerDeps {
+            orchestrator: &parent_orchestrator,
+            session: session.as_ref(),
+            memory_manager: None,
+            hooks: None,
+            max_turns: 8,
+            active_agent: AgentId::new("parent"),
+            tools: None,
+            trace_sink: None,
+            task_workspace: None,
+            policy: &parent_policy,
+            subagents: Some(&registry),
+            input_guardrails: &[],
+            output_guardrails: &[],
+            tool_guardrails: &[],
+        };
+        let input = Envelope {
+            channel_id: ChannelId::new("telegram"),
+            conversation_id: ConversationId::new("chat-1"),
+            sender: Arc::from("user"),
+            message: Message::text(MessageRole::User, "delegate"),
+            metadata: BTreeMap::new(),
+        };
+
+        let paused_state = match run_envelope(input, RunId::new("parent-run"), &deps)
+            .await
+            .expect("run should pause")
+        {
+            RunOutcome::Paused(state) => state,
+            RunOutcome::Finished { .. } => panic!("expected parent pause"),
+        };
+        let approval = paused_state
+            .pending_approvals
+            .first()
+            .expect("parent approval expected");
+        assert!(matches!(
+            &approval.action,
+            InterruptionAction::ResumeSubAgent { child_state, .. }
+                if child_state.pending_approvals.len() == 1
+        ));
+        let approval_id = approval.id.clone();
+
+        let paused = PausedRun {
+            channel_id: ChannelId::new("telegram"),
+            conversation_id: ConversationId::new("chat-1"),
+            state: paused_state,
+        };
+        let output = match resume_run(paused, &approval_id, ResumeDecision::Approve, &deps)
+            .await
+            .expect("resume should finish")
+        {
+            RunOutcome::Finished { output, .. } => output,
+            RunOutcome::Paused(_) => panic!("expected finished parent run"),
+        };
+
+        assert_eq!(
+            output.message.content.as_ref(),
+            "parent saw: child finished"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_allowlisted_tool_runs_without_parent_approval() {
+        let session = Arc::new(InMemorySession::default());
+        let child_orchestrator = Arc::new(ChildApprovalOrchestrator);
+        let parent_orchestrator = ParentDelegateOrchestrator;
+        let mut registry = SubAgentRegistry::new().with_session(session.clone());
+        let mut tools = ToolRegistry::new();
+        tools.register(MockApprovalTool);
+        let tools = Arc::new(tools);
+        registry.register(
+            SubAgentDefinition::new(
+                AgentId::new("child"),
+                "child-policy",
+                child_orchestrator,
+                Policy::allow_tools(["mock"]),
+            )
+            .with_tools(tools)
+            .with_max_turns(4),
+        );
+        let parent_policy = Policy {
+            rules: vec![
+                PolicyRule {
+                    action: PolicyAction::Delegate,
+                    decision: PolicyVerb::Allow,
+                    reason: None,
+                    arg_equals: BTreeMap::new(),
+                },
+                PolicyRule {
+                    action: PolicyAction::Tool(Arc::from("mock")),
+                    decision: PolicyVerb::AskUser,
+                    reason: Some(Arc::from("mock requires approval")),
+                    arg_equals: BTreeMap::new(),
+                },
+            ],
+            default_decision: PolicyVerb::Deny,
+        };
+        let deps = RunnerDeps {
+            orchestrator: &parent_orchestrator,
+            session: session.as_ref(),
+            memory_manager: None,
+            hooks: None,
+            max_turns: 8,
+            active_agent: AgentId::new("parent"),
+            tools: None,
+            trace_sink: None,
+            task_workspace: None,
+            policy: &parent_policy,
+            subagents: Some(&registry),
+            input_guardrails: &[],
+            output_guardrails: &[],
+            tool_guardrails: &[],
+        };
+        let input = Envelope {
+            channel_id: ChannelId::new("telegram"),
+            conversation_id: ConversationId::new("chat-1"),
+            sender: Arc::from("user"),
+            message: Message::text(MessageRole::User, "delegate"),
+            metadata: BTreeMap::new(),
+        };
+
+        let output = match run_envelope(input, RunId::new("parent-run"), &deps)
+            .await
+            .expect("allowlisted child tool should finish")
+        {
+            RunOutcome::Finished { output, .. } => output,
+            RunOutcome::Paused(_) => panic!("allowlisted child tool should not pause"),
+        };
+
+        assert_eq!(
+            output.message.content.as_ref(),
+            "parent saw: child finished"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_guardrail_trip_returns_failed_tool_result_to_model() {
+        let session = InMemorySession::default();
+        let orchestrator = ToolThenReplyOrchestrator;
+        let mut tools = ToolRegistry::new();
+        tools.register(MockApprovalTool);
+        let guardrails = [ToolGuardrailEntry {
+            name: Arc::from("MockGuardrail"),
+            guardrail: &DenyMockToolGuardrail,
+        }];
+        let deps = RunnerDeps {
+            orchestrator: &orchestrator,
+            session: &session,
+            memory_manager: None,
+            hooks: None,
+            max_turns: 4,
+            active_agent: AgentId::new("parent"),
+            tools: Some(&tools),
+            trace_sink: None,
+            task_workspace: None,
+            policy: &Policy::allow_tools(["mock"]),
+            subagents: None,
+            input_guardrails: &[],
+            output_guardrails: &[],
+            tool_guardrails: &guardrails,
+        };
+        let input = Envelope {
+            channel_id: ChannelId::new("telegram"),
+            conversation_id: ConversationId::new("chat-1"),
+            sender: Arc::from("user"),
+            message: Message::text(MessageRole::User, "run tool"),
+            metadata: BTreeMap::new(),
+        };
+
+        let output = match run_envelope(input, RunId::new("guardrail-run"), &deps)
+            .await
+            .expect("guardrail trip should become tool result")
+        {
+            RunOutcome::Finished { output, .. } => output,
+            RunOutcome::Paused(_) => panic!("expected finished run"),
+        };
+
+        assert!(output
+            .message
+            .content
+            .contains("guardrail 'MockGuardrail' tripped: blocked by test"));
+    }
+
+    #[tokio::test]
+    async fn budget_exhausted_finishes_with_partial_result_not_error() {
+        // An orchestrator that never replies used to abort the whole run with
+        // `MaxTurnsExceeded`. It must now terminate gracefully: a finished run
+        // carrying the best partial result plus a truncation notice, and never
+        // exceeding the turn budget.
+        let session = InMemorySession::default();
+        let orchestrator = AlwaysToolOrchestrator;
+        let mut tools = ToolRegistry::new();
+        tools.register(MockApprovalTool);
+        let deps = RunnerDeps {
+            orchestrator: &orchestrator,
+            session: &session,
+            memory_manager: None,
+            hooks: None,
+            max_turns: 3,
+            active_agent: AgentId::new("agent"),
+            tools: Some(&tools),
+            trace_sink: None,
+            task_workspace: None,
+            policy: &Policy::allow_tools(["mock"]),
+            subagents: None,
+            input_guardrails: &[],
+            output_guardrails: &[],
+            tool_guardrails: &[],
+        };
+        let input = Envelope {
+            channel_id: ChannelId::new("telegram"),
+            conversation_id: ConversationId::new("chat-1"),
+            sender: Arc::from("user"),
+            message: Message::text(MessageRole::User, "do something open-ended"),
+            metadata: BTreeMap::new(),
+        };
+
+        let (state, output) = match run_envelope(input, RunId::new("budget-run"), &deps)
+            .await
+            .expect("budget exhaustion must not be a hard error")
+        {
+            RunOutcome::Finished { state, output } => (state, output),
+            RunOutcome::Paused(_) => panic!("expected finished run"),
+        };
+
+        assert!(
+            output.message.content.contains("step budget"),
+            "final message should carry a truncation notice, got: {}",
+            output.message.content
+        );
+        assert_eq!(
+            output.message.metadata.get("run_truncated"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        // The safeguard preserves the budget: at most `max_turns` tool spans.
+        let tool_spans = state
+            .trace_spans
+            .iter()
+            .filter(|span| span.kind == SpanKind::Tool)
+            .count();
+        assert!(
+            tool_spans <= 3,
+            "expected <= 3 tool turns, saw {tool_spans}"
+        );
+    }
+
+    struct ParentDelegateOrchestrator;
+
+    #[async_trait]
+    impl Orchestrator for ParentDelegateOrchestrator {
+        async fn plan(&self, ctx: &RunContext<'_>) -> Result<Plan, OrchestratorError> {
+            let Some(item) = ctx.state.transcript.items.last() else {
+                return Ok(Plan::Reply(Message::text(MessageRole::Assistant, "")));
+            };
+            match item.message.role {
+                MessageRole::User => Ok(Plan::Delegate(SubAgentSpec {
+                    agent_id: AgentId::new("child"),
+                    policy_id: Arc::from("child-policy"),
+                    metadata: BTreeMap::new(),
+                })),
+                MessageRole::Tool => Ok(Plan::Reply(Message::text(
+                    MessageRole::Assistant,
+                    format!("parent saw: {}", item.message.content),
+                ))),
+                MessageRole::Assistant | MessageRole::System => {
+                    Ok(Plan::Reply(Message::text(MessageRole::Assistant, "")))
+                }
+            }
+        }
+    }
+
+    struct ChildApprovalOrchestrator;
+
+    #[async_trait]
+    impl Orchestrator for ChildApprovalOrchestrator {
+        async fn plan(&self, ctx: &RunContext<'_>) -> Result<Plan, OrchestratorError> {
+            let Some(item) = ctx.state.transcript.items.last() else {
+                return Ok(Plan::Reply(Message::text(MessageRole::Assistant, "")));
+            };
+            match item.message.role {
+                MessageRole::User => {
+                    let args = RawValue::from_string(json!({ "ok": true }).to_string()).unwrap();
+                    Ok(Plan::CallTool(ToolCall {
+                        id: ToolCallId::new("child-mock"),
+                        name: Arc::from("mock"),
+                        args,
+                    }))
+                }
+                MessageRole::Tool => Ok(Plan::Reply(Message::text(
+                    MessageRole::Assistant,
+                    "child finished",
+                ))),
+                MessageRole::Assistant | MessageRole::System => {
+                    Ok(Plan::Reply(Message::text(MessageRole::Assistant, "")))
+                }
+            }
+        }
+    }
+
+    struct ToolThenReplyOrchestrator;
+
+    #[async_trait]
+    impl Orchestrator for ToolThenReplyOrchestrator {
+        async fn plan(&self, ctx: &RunContext<'_>) -> Result<Plan, OrchestratorError> {
+            let Some(item) = ctx.state.transcript.items.last() else {
+                return Ok(Plan::Reply(Message::text(MessageRole::Assistant, "")));
+            };
+            match item.message.role {
+                MessageRole::User => {
+                    let args = RawValue::from_string(json!({ "ok": true }).to_string()).unwrap();
+                    Ok(Plan::CallTool(ToolCall {
+                        id: ToolCallId::new("guarded-mock"),
+                        name: Arc::from("mock"),
+                        args,
+                    }))
+                }
+                MessageRole::Tool => Ok(Plan::Reply(Message::text(
+                    MessageRole::Assistant,
+                    format!("tool result: {}", item.message.content),
+                ))),
+                MessageRole::Assistant | MessageRole::System => {
+                    Ok(Plan::Reply(Message::text(MessageRole::Assistant, "")))
+                }
+            }
+        }
+    }
+
+    /// Never replies — always asks for another tool call. Without the
+    /// turn-budget safeguard this loops until `MaxTurnsExceeded`.
+    struct AlwaysToolOrchestrator;
+
+    #[async_trait]
+    impl Orchestrator for AlwaysToolOrchestrator {
+        async fn plan(&self, _ctx: &RunContext<'_>) -> Result<Plan, OrchestratorError> {
+            let args = RawValue::from_string(json!({ "ok": true }).to_string()).unwrap();
+            Ok(Plan::CallTool(ToolCall {
+                id: ToolCallId::new("loop-mock"),
+                name: Arc::from("mock"),
+                args,
+            }))
+        }
+    }
+
+    struct DenyMockToolGuardrail;
+
+    #[async_trait]
+    impl ToolGuardrail for DenyMockToolGuardrail {
+        async fn check_call(
+            &self,
+            call: &ToolCall,
+            _ctx: &RunContext<'_>,
+        ) -> Result<GuardrailOutcome, GuardrailError> {
+            if call.name.as_ref() == "mock" {
+                Ok(GuardrailOutcome::Tripped(Arc::from("blocked by test")))
+            } else {
+                Ok(GuardrailOutcome::Passed)
+            }
+        }
+
+        async fn check_result(
+            &self,
+            _result: &ToolResult,
+            _ctx: &RunContext<'_>,
+        ) -> Result<GuardrailOutcome, GuardrailError> {
+            Ok(GuardrailOutcome::Passed)
+        }
+    }
+
+    struct MockApprovalTool;
+
+    #[async_trait]
+    impl Tool for MockApprovalTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: Arc::from("mock"),
+                description: Arc::from("mock approval tool"),
+                input_schema: json!({"type": "object"}),
+                requires_isolation: false,
+            }
+        }
+
+        async fn call(&self, call: &ToolCall, _args: &RawValue) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult {
+                call_id: call.id.clone(),
+                status: ToolStatus::Succeeded,
+                content: Arc::from("ok"),
+                metadata: BTreeMap::new(),
+            })
+        }
+    }
 }

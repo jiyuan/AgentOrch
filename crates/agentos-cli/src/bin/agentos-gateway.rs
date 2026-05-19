@@ -1,13 +1,14 @@
-use agentos_cli::slash::{self, Parsed, SlashCommand, SlashContext};
+use agentos_cli::slash::{self, Parsed, SessionUsage, SlashCommand, SlashContext};
 use agentos_core::channels::{feishu::FeishuChannel, telegram::TelegramChannel};
 use agentos_core::config::WorkspaceConfig;
 use agentos_core::crons::CronStore;
-use agentos_core::gateway::{apply_reply_prefix, extract_reply_prefix, GatewayRun, GatewayService};
+use agentos_core::gateway::{GatewayRun, GatewayService};
 use agentos_core::runner::ResumeDecision;
 use agentos_core::runtime::{load_workspace_config, AgentRuntime, RuntimePaths};
 use agentos_interfaces::Channel;
 use agentos_llm::env as agentos_env;
 use agentos_proto::{Envelope, Message, MessageRole, RunId, SpanKind};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -573,6 +574,7 @@ where
     let cron_store = CronStore::new(cron_dir_path(&workspace_dir(&agent_config_path(config))));
     let orchestrator_handle = runtime.orchestrator.strategy_handle();
     let model_controller = runtime.model_controller.clone();
+    let session_usage = SessionUsage::new();
     log_line(config, &format!("{channel_name} gateway loop started"))?;
 
     loop {
@@ -589,7 +591,6 @@ where
             thread::sleep(Duration::from_secs(1));
             continue;
         };
-        extract_reply_prefix(&mut input);
         match slash::parse(&input.message.content) {
             Parsed::Cmd(SlashCommand::Clear) => {
                 let removed = runtime
@@ -631,6 +632,7 @@ where
                     memory_manager: runtime.memory_manager.as_ref(),
                     orchestrator_handle: Some(&orchestrator_handle),
                     model_controller: Some(&model_controller),
+                    session_usage: Some(&session_usage),
                     agent_id: &runtime.active_agent,
                     conversation_id: &input.conversation_id,
                 };
@@ -679,6 +681,7 @@ where
             .await
         {
             Ok(GatewayRun::Finished { state, .. }) => {
+                session_usage.record_run(&state.usage);
                 log_trace(config, &state)?;
             }
             Ok(GatewayRun::Paused { mut paused, .. }) => loop {
@@ -713,6 +716,7 @@ where
                     .await
                 {
                     Ok(GatewayRun::Finished { state, .. }) => {
+                        session_usage.record_run(&state.usage);
                         log_trace(config, &state)?;
                         break;
                     }
@@ -790,37 +794,6 @@ fn persistent_channels_from_override(
 fn push_unique_channel(channels: &mut Vec<&'static str>, channel: &'static str) {
     if !channels.contains(&channel) {
         channels.push(channel);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn persistent_channels_default_to_config() {
-        let mut config = WorkspaceConfig::default();
-        config.channels.telegram.enabled = true;
-        config.channels.feishu.enabled = false;
-
-        assert_eq!(
-            persistent_channels_from_override(&config, None).expect("channels resolve"),
-            vec!["telegram"]
-        );
-    }
-
-    #[test]
-    fn persistent_channels_env_override_takes_precedence() {
-        let mut config = WorkspaceConfig::default();
-        config.channels.telegram.enabled = false;
-        config.channels.feishu.enabled = false;
-
-        assert_eq!(
-            persistent_channels_from_override(&config, Some("feishu,telegram,telegram"))
-                .expect("channels resolve"),
-            vec!["feishu", "telegram"]
-        );
-        assert!(persistent_channels_from_override(&config, Some("slack")).is_err());
     }
 }
 
@@ -931,15 +904,13 @@ fn failure_envelope(input: &Envelope, sender: &str, error: &str) -> Envelope {
 }
 
 fn command_reply_envelope(input: &Envelope, sender: &str, content: &str) -> Envelope {
-    let mut output = Envelope {
+    Envelope {
         channel_id: input.channel_id.clone(),
         conversation_id: input.conversation_id.clone(),
         sender: Arc::from(sender),
         message: Message::text(MessageRole::Assistant, content),
-        metadata: input.metadata.clone(),
-    };
-    apply_reply_prefix(&mut output);
-    output
+        metadata: BTreeMap::new(),
+    }
 }
 
 fn user_facing_error_message(error: &str) -> String {
@@ -1095,4 +1066,35 @@ fn log_line(config: &ServiceConfig, message: &str) -> Result<(), String> {
 fn display_optional_path(path: &Option<PathBuf>) -> String {
     path.as_ref()
         .map_or_else(|| "<unset>".to_owned(), |path| path.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persistent_channels_default_to_config() {
+        let mut config = WorkspaceConfig::default();
+        config.channels.telegram.enabled = true;
+        config.channels.feishu.enabled = false;
+
+        assert_eq!(
+            persistent_channels_from_override(&config, None).expect("channels resolve"),
+            vec!["telegram"]
+        );
+    }
+
+    #[test]
+    fn persistent_channels_env_override_takes_precedence() {
+        let mut config = WorkspaceConfig::default();
+        config.channels.telegram.enabled = false;
+        config.channels.feishu.enabled = false;
+
+        assert_eq!(
+            persistent_channels_from_override(&config, Some("feishu,telegram,telegram"))
+                .expect("channels resolve"),
+            vec!["feishu", "telegram"]
+        );
+        assert!(persistent_channels_from_override(&config, Some("slack")).is_err());
+    }
 }

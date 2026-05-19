@@ -129,6 +129,8 @@ pub struct MemoryCaller {
     pub user_id: Option<Arc<str>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_shared_domains: Vec<Arc<str>>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub audit_read_access: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -140,6 +142,10 @@ pub struct HydrationRequest {
     pub max_tokens: usize,
     pub stores: Vec<MemoryStore>,
     pub strategy: RetrievalStrategy,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

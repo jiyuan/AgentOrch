@@ -4,6 +4,7 @@ mod web_research;
 mod workspace;
 
 pub use planner::{builtin_skill_planners, SkillPlanner};
+pub(crate) use skill_creator::is_skill_authoring_request;
 pub use skill_creator::SkillCreatorSkill;
 pub use web_research::WebResearchSkill;
 pub use workspace::{

@@ -9,43 +9,9 @@ use std::sync::Arc;
 
 pub(super) const ROUTER_CONFIDENCE_THRESHOLD: f32 = 0.60;
 
-pub(super) fn classify_task(input: &str) -> Option<TaskDomain> {
-    let input = input.to_ascii_lowercase();
-    if input.contains("implement")
-        || input.contains("debug")
-        || input.contains("bug")
-        || input.contains("code")
-        || input.contains("software")
-    {
-        Some(TaskDomain::SoftwareDev)
-    } else if input.contains("content") || input.contains("publish") || input.contains("campaign") {
-        Some(TaskDomain::ContentOps)
-    } else if input.contains("research")
-        || input.contains("investigate")
-        || input.contains("summarize")
-    {
-        Some(TaskDomain::Research)
-    } else if input.contains("edit") || input.contains("rewrite") || input.contains("proofread") {
-        Some(TaskDomain::Editing)
-    } else {
-        None
-    }
-}
-
 pub(super) fn latest_user_content(ctx: &RunContext<'_>) -> Option<Arc<str>> {
     let item = ctx.state.transcript.items.last()?;
     (item.message.role == MessageRole::User).then_some(Arc::clone(&item.message.content))
-}
-
-pub(super) fn rule_for_domain<'a>(
-    routing_table: &'a RoutingTable,
-    domain: &TaskDomain,
-) -> Option<&'a RoutingRule> {
-    routing_table
-        .rules
-        .iter()
-        .find(|rule| &rule.domain == domain)
-        .or_else(|| (&routing_table.fallback.domain == domain).then_some(&routing_table.fallback))
 }
 
 pub(super) fn rule_for_domain_key<'a>(
@@ -75,13 +41,14 @@ pub(super) fn routing_classifier_messages(
                 "domain": domain_key(&rule.domain),
                 "description": rule.description,
                 "examples": rule.examples,
+                "dispatch": dispatch_descriptor(&rule.dispatch),
             })
         })
         .collect::<Vec<_>>();
     vec![
         Message::text(
             MessageRole::System,
-            "Classify the user's task using only the provided routing domains. Return only JSON with fields: domain, confidence.",
+            "Classify the user's task using only the provided routing domains and their delegate/escalation target descriptions. Prefer the target whose functional description best matches the requested work; do not use keyword matching. Return only JSON with fields: domain, confidence.",
         ),
         Message::text(
             MessageRole::User,
@@ -92,6 +59,45 @@ pub(super) fn routing_classifier_messages(
             ),
         ),
     ]
+}
+
+fn dispatch_descriptor(dispatch: &DispatchTarget) -> Value {
+    match dispatch {
+        DispatchTarget::Direct => json!({
+            "kind": "direct",
+            "target": "parent",
+            "description": "Handle directly in the parent run."
+        }),
+        DispatchTarget::Delegate(spec) => json!({
+            "kind": "delegate",
+            "agent_id": spec.agent_id.as_str(),
+            "policy_id": spec.policy_id,
+            "subagent": subagent_descriptor(&spec.metadata),
+        }),
+        DispatchTarget::Escalate(template) => json!({
+            "kind": "escalate",
+            "template": template.name,
+            "stages": template.stages.iter().map(|stage| {
+                json!({
+                    "stage": stage.name,
+                    "agent_id": stage.agent.agent_id.as_str(),
+                    "policy_id": stage.agent.policy_id,
+                    "subagent": subagent_descriptor(&stage.agent.metadata),
+                    "depends_on": stage.depends_on,
+                })
+            }).collect::<Vec<_>>(),
+        }),
+    }
+}
+
+fn subagent_descriptor(metadata: &BTreeMap<Arc<str>, Value>) -> Value {
+    json!({
+        "name": metadata.get("subagent_name").and_then(Value::as_str),
+        "description": metadata.get("subagent_description").and_then(Value::as_str),
+        "tools": metadata.get("subagent_tools").and_then(Value::as_array).cloned().unwrap_or_default(),
+        "skills": metadata.get("subagent_skills").and_then(Value::as_array).cloned().unwrap_or_default(),
+        "max_turns": metadata.get("subagent_max_turns").and_then(Value::as_u64),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,5 +172,71 @@ pub(super) fn materialize_dispatch(
                 metadata,
             }))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentos_interfaces::orchestrator::{OrchestratorTemplate, Stage, SubAgentSpec, TaskDomain};
+    use agentos_proto::AgentId;
+
+    #[test]
+    fn routing_prompt_includes_subagent_functional_descriptions() {
+        let mut research_metadata = BTreeMap::new();
+        research_metadata.insert(
+            Arc::from("subagent_name"),
+            Value::String("research-subagent".to_owned()),
+        );
+        research_metadata.insert(
+            Arc::from("subagent_description"),
+            Value::String("Performs bounded research using configured HTTP resources.".to_owned()),
+        );
+        research_metadata.insert(
+            Arc::from("subagent_tools"),
+            Value::Array(vec![Value::String("http".to_owned())]),
+        );
+        research_metadata.insert(
+            Arc::from("subagent_skills"),
+            Value::Array(vec![Value::String("web-research".to_owned())]),
+        );
+        research_metadata.insert(Arc::from("subagent_max_turns"), Value::from(4));
+        let table = RoutingTable {
+            rules: vec![RoutingRule {
+                domain: TaskDomain::Research,
+                description: Arc::from("External evidence gathering."),
+                examples: Vec::new(),
+                dispatch: DispatchTarget::Escalate(OrchestratorTemplate {
+                    name: Arc::from("research"),
+                    stages: vec![Stage {
+                        name: Arc::from("research"),
+                        agent: SubAgentSpec {
+                            agent_id: AgentId::new("research-subagent"),
+                            policy_id: Arc::from("readonly-web"),
+                            metadata: research_metadata,
+                        },
+                        depends_on: Vec::new(),
+                    }],
+                }),
+            }],
+            fallback: RoutingRule {
+                domain: TaskDomain::General,
+                description: Arc::from("General fallback."),
+                examples: Vec::new(),
+                dispatch: DispatchTarget::Direct,
+            },
+        };
+
+        let messages = routing_classifier_messages("compare these sources", &table);
+        let prompt = messages
+            .iter()
+            .map(|message| message.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(prompt.contains("Performs bounded research using configured HTTP resources."));
+        assert!(prompt.contains("web-research"));
+        assert!(prompt.contains("readonly-web"));
+        assert!(prompt.contains("do not use keyword matching"));
     }
 }

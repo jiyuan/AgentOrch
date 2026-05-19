@@ -11,13 +11,16 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # functionality in a new module rather than extending the existing one."
 limit=800
 
-# Pre-existing CLI binary offenders. These are application-level entry points,
-# not library modules, and are tracked separately from the agentos-core split
-# work. Trim the list as each file is split.
-declare -A allowlist=(
-  ["crates/agentos-cli/src/main.rs"]=1
-  ["crates/agentos-cli/src/bin/agentos-gateway.rs"]=1
-)
+# Pre-existing offenders tracked separately from the agentos-core split work.
+# Keep this POSIX-ish instead of using associative arrays so the script works on
+# the older Bash shipped by default on macOS.
+is_allowlisted() {
+  case "$1" in
+    crates/agentos-cli/src/main.rs) return 0 ;;
+    crates/agentos-cli/src/bin/agentos-gateway.rs) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 # Count `cfg(test)`-stripped lines in a file by tracking brace depth.
 # Lines from a `#[cfg(test)]` annotation through the matching closing brace
@@ -67,7 +70,7 @@ while IFS= read -r -d "" file; do
     continue
   fi
 
-  if [[ -n "${allowlist[$rel]:-}" ]]; then
+  if is_allowlisted "$rel"; then
     echo "warn: $rel is $effective LOC (allowlisted; budget $limit)"
     continue
   fi

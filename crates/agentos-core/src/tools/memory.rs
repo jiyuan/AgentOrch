@@ -2,7 +2,7 @@ use crate::memory::{
     memory_caller_from_context, MemoryCaller, MemoryManager, MemoryOwner, MemoryScope, MemoryStore,
     MemoryVisibility,
 };
-use agentos_interfaces::memory::{Memory, Query, Selector};
+use agentos_interfaces::memory::{Query, Selector};
 use agentos_interfaces::orchestrator::RunContext;
 use agentos_interfaces::tool::{Tool, ToolError, ToolSpec};
 use agentos_proto::{
@@ -23,21 +23,10 @@ pub struct MemoryTool {
 }
 
 impl MemoryTool {
-    pub fn new(memory: Arc<dyn Memory>) -> Self {
-        Self::with_manager(Arc::new(MemoryManager::new(memory)))
-    }
-
     pub fn with_manager(manager: Arc<MemoryManager>) -> Self {
         Self {
             manager,
             legacy_namespace: Namespace::new(LEGACY_FACTS_NAMESPACE),
-        }
-    }
-
-    pub fn with_namespace(memory: Arc<dyn Memory>, default_namespace: Namespace) -> Self {
-        Self {
-            manager: Arc::new(MemoryManager::new(memory)),
-            legacy_namespace: default_namespace,
         }
     }
 }
@@ -510,6 +499,7 @@ fn fallback_caller() -> MemoryCaller {
         conversation_id: ConversationId::new("memory-tool"),
         user_id: None,
         allowed_shared_domains: Vec::new(),
+        audit_read_access: false,
     }
 }
 

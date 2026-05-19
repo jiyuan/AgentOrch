@@ -4,7 +4,8 @@
 //!
 //! 1. **Production helpers**: `workspace_root`, `safe_workspace_path`,
 //!    `elapsed_ms`, `result_metadata`, `default_cron_dir`, `default_skills_dir`.
-//!    Production code reaches for them via `super::common::*`.
+//!    The runtime pins the path-related environment variables from
+//!    `RuntimePaths`; the fallbacks here are only for standalone tool use.
 //!
 //! 2. **Test plumbing**: `TEST_CRON_DIR`, `TEST_SKILLS_DIR`, and the matching
 //!    RAII guards. Production code never sets these — `cron_root_for_tests`
@@ -16,13 +17,27 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Resolve the workspace root for model-supplied path checks. Defaults to
-/// the gateway's cwd (the project root in typical deployments), overridable
-/// via `$AGENTOS_WORKSPACE_ROOT` for tests or unusual layouts.
-pub(super) fn workspace_root() -> PathBuf {
+/// Resolve the workspace root for model-supplied path checks. The runtime sets
+/// `$AGENTOS_WORKSPACE_ROOT`; standalone tool use falls back to the current
+/// directory.
+pub(crate) fn workspace_root() -> PathBuf {
     std::env::var_os("AGENTOS_WORKSPACE_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+/// On-disk root for skill bundles, used by both the `skill_validate` tool and
+/// the skill-bundle write boundary guardrail so they resolve the same
+/// directory. Honors the test override and `$AGENTOS_SKILLS_DIR` (set by the
+/// runtime); falls back to `workspace/skills` under the workspace root, which
+/// matches the repository layout.
+pub(crate) fn skills_dir() -> PathBuf {
+    if let Some(dir) = skills_root_for_tests() {
+        return dir;
+    }
+    std::env::var_os("AGENTOS_SKILLS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join("workspace").join("skills"))
 }
 
 /// Validate that `requested` stays inside `root`. Reject:
@@ -35,7 +50,7 @@ pub(super) fn workspace_root() -> PathBuf {
 /// absolute path for I/O). This is intentionally stricter than
 /// `Path::canonicalize`, which requires the target to exist and would fail
 /// for "write to a new file."
-pub(super) fn safe_workspace_path(root: &Path, requested: &Path) -> Result<PathBuf, String> {
+pub(crate) fn safe_workspace_path(root: &Path, requested: &Path) -> Result<PathBuf, String> {
     if requested.as_os_str().is_empty() {
         return Err("empty path".to_owned());
     }
@@ -77,22 +92,30 @@ pub(super) fn result_metadata(duration_ms: u64, bytes_out: u64) -> BTreeMap<Arc<
     metadata
 }
 
-/// Resolve the on-disk root for cron task files, matching the convention used
-/// by `agentos-cli`: respect `$AGENTOS_CRON_DIR` if set, else fall back to
-/// `workspace/crons` relative to the gateway's cwd.
+/// Resolve the on-disk root for cron task files. The runtime sets
+/// `$AGENTOS_CRON_DIR`; standalone tool use falls back to `crons` under the
+/// current directory.
 pub(super) fn default_cron_dir() -> PathBuf {
     std::env::var_os("AGENTOS_CRON_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new("workspace").join("crons"))
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("crons")
+        })
 }
 
-/// Resolve the on-disk root for workspace skills. Matches the runtime
-/// convention from `runtime::skills_root()` but folded into the tool layer
-/// so the LLM never picks its own directory.
+/// Resolve the on-disk root for workspace skills. The runtime sets
+/// `$AGENTOS_SKILLS_DIR`; standalone tool use falls back to `skills` under the
+/// current directory.
 pub(super) fn default_skills_dir() -> PathBuf {
     std::env::var_os("AGENTOS_SKILLS_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new("workspace").join("skills"))
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("skills")
+        })
 }
 
 #[cfg(test)]

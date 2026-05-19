@@ -127,7 +127,7 @@ impl Policy {
     }
 
     pub fn decide(&self, plan: &Plan) -> PolicyDecision {
-        if matches!(plan, Plan::Reply(_)) {
+        if matches!(plan, Plan::Reply(_) | Plan::ResumeSubAgent { .. }) {
             return PolicyDecision::Allow;
         }
 
@@ -168,9 +168,20 @@ impl Policy {
         for child_rule in &child.rules {
             match child_rule.decision {
                 PolicyVerb::Allow => {
-                    if !parent.rules.iter().any(|parent_rule| {
-                        parent_rule.decision == PolicyVerb::Allow && parent_rule.covers(child_rule)
-                    }) {
+                    // A child `Allow` is valid if the parent already exposes
+                    // that exact action (the normal `covers` check) OR — for
+                    // tools — if the parent governs the same tool at all with
+                    // an Allow/AskUser rule. The latter lets an explicit
+                    // sub-agent tool allowlist suppress approval prompts for a
+                    // tool the parent itself can use, without letting the
+                    // sub-agent reach tools the parent denies or never grants.
+                    let covered = parent.rules.iter().any(|parent_rule| {
+                        matches!(
+                            parent_rule.decision,
+                            PolicyVerb::Allow | PolicyVerb::AskUser
+                        ) && parent_rule.covers(child_rule)
+                    });
+                    if !covered && !parent_exposes_tool(parent, child_rule) {
                         return Err(PolicyError::Widened(child_rule.label()));
                     }
                 }
@@ -213,6 +224,24 @@ fn memory_policy_rules() -> Vec<PolicyRule> {
             arg_equals: BTreeMap::from([(Arc::from("operation"), Value::from("forget"))]),
         },
     ]
+}
+
+/// True when `child_rule` targets a tool the parent already exposes to this
+/// delegatee (any same-tool rule whose decision is `Allow` or `AskUser`).
+///
+/// This is the mechanism behind "an explicitly allowlisted sub-agent tool
+/// needs no approval": the parent may gate the tool behind `AskUser` (or
+/// per-operation arg constraints) for itself, but a sub-agent that names the
+/// tool in its allowlist gets blanket `Allow`. Tools the parent denies or
+/// never grants are not exposed, so the sub-agent still cannot reach them.
+fn parent_exposes_tool(parent: &Policy, child_rule: &PolicyRule) -> bool {
+    let PolicyAction::Tool(child_tool) = &child_rule.action else {
+        return false;
+    };
+    parent.rules.iter().any(|rule| {
+        matches!(rule.decision, PolicyVerb::Allow | PolicyVerb::AskUser)
+            && matches!(&rule.action, PolicyAction::Tool(tool) if tool == child_tool)
+    })
 }
 
 fn default_decision_covers(parent: &PolicyVerb, child: &PolicyVerb) -> bool {
@@ -319,6 +348,12 @@ fn default_deny_reason(plan: &Plan) -> String {
         }
         Plan::Escalate(spec) => {
             format!("escalation to '{}' is not allowed", spec.template.name)
+        }
+        Plan::ResumeSubAgent { spec, .. } => {
+            format!(
+                "resuming sub-agent '{}' is not allowed",
+                spec.agent_id.as_str()
+            )
         }
     }
 }
@@ -553,6 +588,15 @@ mod tests {
 
         let deny = tool_call("file", "{\"operation\":\"write\"}");
         assert!(matches!(policy.decide(&deny), PolicyDecision::Deny { .. }));
+    }
+
+    #[test]
+    fn narrow_allows_child_allow_when_parent_would_ask_user() {
+        let parent = Policy::ask_user_tools(["shell"]);
+        let child = Policy::allow_tools(["shell"]);
+
+        Policy::narrow(&parent, &child)
+            .expect("delegated child allowlist may allow a parent-ask tool");
     }
 
     #[test]

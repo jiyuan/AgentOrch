@@ -23,13 +23,15 @@ pub use subagents::SubAgentConfig;
 
 use normalize::normalize_domain;
 use orchestrator::rule_from_config;
-use subagents::{normalize_memory_tool, normalize_memory_view, subagent_memory_metadata};
+use subagents::{normalize_memory_tool, normalize_memory_view, subagent_metadata};
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct WorkspaceConfig {
     pub agent: AgentConfig,
+    pub policy: PolicyConfig,
     pub memory: MemoryConfig,
+    pub channels: ChannelsConfig,
     pub isolation: IsolationConfig,
     pub subagents: Vec<SubAgentConfig>,
     pub mcp_servers: Vec<McpServerConfig>,
@@ -56,6 +58,63 @@ impl Default for AgentConfig {
             orchestrator: Arc::from("builtin.max"),
             memory: Arc::from("memory.in_memory"),
             max_turns: 16,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct PolicyConfig {
+    pub default: Arc<str>,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            default: Arc::from("deny"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct ChannelsConfig {
+    pub tui: ChannelConfig,
+    pub telegram: ChannelConfig,
+    pub feishu: ChannelConfig,
+}
+
+impl Default for ChannelsConfig {
+    fn default() -> Self {
+        Self {
+            tui: ChannelConfig {
+                enabled: true,
+                mode: Arc::from("interactive"),
+            },
+            telegram: ChannelConfig {
+                enabled: false,
+                mode: Arc::from("poll_once"),
+            },
+            feishu: ChannelConfig {
+                enabled: false,
+                mode: Arc::from("long_connection"),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct ChannelConfig {
+    pub enabled: bool,
+    pub mode: Arc<str>,
+}
+
+impl Default for ChannelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: Arc::from("disabled"),
         }
     }
 }
@@ -117,7 +176,14 @@ impl Default for ResourceConfig {
                 Arc::from("llm"),
             ],
             skills: ResourceSection::default(),
-            tools: ResourceSection::default(),
+            tools: ResourceSection {
+                enabled: vec![
+                    Arc::from("file"),
+                    Arc::from("http"),
+                    Arc::from("memory"),
+                    Arc::from("shell"),
+                ],
+            },
             mcp: ResourceSection::default(),
             llm: ResourceSection::default(),
         }
@@ -154,6 +220,13 @@ impl WorkspaceConfig {
         };
         config.resolve_paths(config_dir);
         config.validate_memory().map_err(std::io::Error::other)?;
+        config.subagents.extend(load_subagent_files(config_dir)?);
+        config
+            .orchestrator_templates
+            .extend(load_suborch_files(config_dir)?);
+        config.validate_policy().map_err(std::io::Error::other)?;
+        config.validate_channels().map_err(std::io::Error::other)?;
+        config.validate_resources().map_err(std::io::Error::other)?;
         config.validate_subagents().map_err(std::io::Error::other)?;
         config.routing_table().map_err(std::io::Error::other)?;
         Ok(config)
@@ -177,6 +250,76 @@ impl WorkspaceConfig {
 
     pub fn validate_memory(&mut self) -> Result<(), String> {
         self.memory.validate()
+    }
+
+    pub fn validate_policy(&self) -> Result<(), String> {
+        match self.policy.default.as_ref() {
+            "allow" | "ask_user" | "deny" => Ok(()),
+            other => Err(format!(
+                "unknown policy.default '{other}'; expected allow, ask_user, or deny"
+            )),
+        }
+    }
+
+    pub fn validate_channels(&self) -> Result<(), String> {
+        validate_channel_mode("channels.tui", &self.channels.tui, &["interactive"])?;
+        validate_channel_mode(
+            "channels.telegram",
+            &self.channels.telegram,
+            &["poll_once", "polling"],
+        )?;
+        validate_channel_mode(
+            "channels.feishu",
+            &self.channels.feishu,
+            &["long_connection"],
+        )?;
+        Ok(())
+    }
+
+    pub fn validate_resources(&self) -> Result<(), String> {
+        for priority in &self.resources.priority {
+            match priority.as_ref() {
+                "skills" | "tools" | "mcp" | "llm" => {}
+                other => {
+                    return Err(format!(
+                        "unknown resources.priority entry '{other}'; expected skills, tools, mcp, or llm"
+                    ));
+                }
+            }
+        }
+        for tool in &self.resources.tools.enabled {
+            match tool.as_ref() {
+                "shell" | "http" | "file" | "memory" | "skill_validate" | "cron_create"
+                | "cron_list" | "cron_remove" => {}
+                other => return Err(format!("unknown resources.tools.enabled entry '{other}'")),
+            }
+        }
+        for llm in &self.resources.llm.enabled {
+            if llm.as_ref() != "llm" {
+                return Err(format!(
+                    "unknown resources.llm.enabled entry '{llm}'; only 'llm' is supported"
+                ));
+            }
+        }
+        let static_mcp_tools = self
+            .mcp_tools
+            .iter()
+            .map(|tool| Arc::clone(&tool.name))
+            .collect::<BTreeSet<_>>();
+        for tool in &self.resources.mcp.enabled {
+            if static_mcp_tools.contains(tool) {
+                continue;
+            }
+            if self.mcp_servers.iter().any(|server| {
+                server.endpoint.starts_with("stdio://") || server.endpoint.starts_with("stdio:")
+            }) {
+                continue;
+            }
+            return Err(format!(
+                "resources.mcp.enabled references unknown MCP tool '{tool}'"
+            ));
+        }
+        Ok(())
     }
 
     pub fn validate_subagents(&mut self) -> Result<(), String> {
@@ -213,7 +356,7 @@ impl WorkspaceConfig {
                     agent_id, policy_id
                 )
             })?;
-        subagent_memory_metadata(subagent)
+        subagent_metadata(subagent)
     }
 
     pub fn resource_index(
@@ -339,5 +482,233 @@ impl WorkspaceConfig {
             }
         }
         Ok(())
+    }
+}
+
+fn validate_channel_mode(
+    section: &str,
+    channel: &ChannelConfig,
+    allowed: &[&str],
+) -> Result<(), String> {
+    if !channel.enabled {
+        return Ok(());
+    }
+    if allowed.iter().any(|mode| channel.mode.as_ref() == *mode) {
+        return Ok(());
+    }
+    Err(format!(
+        "{section}.mode '{}' is not supported; expected one of {}",
+        channel.mode,
+        allowed.join(", ")
+    ))
+}
+
+fn load_subagent_files(config_dir: &Path) -> Result<Vec<SubAgentConfig>, std::io::Error> {
+    let mut files = workspace_toml_files(&config_dir.join("subagents"))?;
+    files
+        .drain(..)
+        .map(|path| {
+            let input = std::fs::read_to_string(&path)?;
+            let mut subagent: SubAgentConfig =
+                toml::from_str(&input).map_err(std::io::Error::other)?;
+            if subagent.name.is_empty() {
+                subagent.name = Arc::clone(&subagent.id);
+            }
+            Ok(subagent)
+        })
+        .collect()
+}
+
+fn load_suborch_files(config_dir: &Path) -> Result<Vec<TemplateConfig>, std::io::Error> {
+    let mut files = workspace_toml_files(&config_dir.join("suborchs"))?;
+    files
+        .drain(..)
+        .map(|path| {
+            let input = std::fs::read_to_string(&path)?;
+            toml::from_str(&input).map_err(std::io::Error::other)
+        })
+        .collect()
+}
+
+fn workspace_toml_files(root: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let mut files = entries
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+        .collect::<Vec<_>>();
+    files.sort();
+    Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_loader_merges_workspace_files_and_effective_schema() {
+        let root = unique_temp_dir("agentos-config-load");
+        std::fs::create_dir_all(root.join("subagents")).expect("create subagents dir");
+        std::fs::create_dir_all(root.join("suborchs")).expect("create suborchs dir");
+        std::fs::write(
+            root.join("agent.toml"),
+            r#"
+[agent]
+max_turns = 9
+
+[policy]
+default = "ask_user"
+
+[channels.tui]
+enabled = true
+mode = "interactive"
+
+[channels.telegram]
+enabled = true
+mode = "poll_once"
+
+[channels.feishu]
+enabled = false
+mode = "long_connection"
+
+[resources]
+priority = ["tools", "mcp", "llm"]
+
+[resources.tools]
+enabled = ["file", "memory"]
+
+[resources.mcp]
+enabled = ["remote_echo"]
+
+[resources.llm]
+enabled = ["llm"]
+
+[task_workspace]
+root = "tasks"
+
+[[mcp_servers]]
+id = "static-mcp"
+endpoint = "static://local"
+
+[[mcp_tools]]
+server_id = "static-mcp"
+name = "remote_echo"
+description = "Static test MCP"
+response = "ok"
+"#,
+        )
+        .expect("write agent config");
+        std::fs::write(
+            root.join("subagents").join("loaded.toml"),
+            r#"
+name = ""
+id = "loaded-agent"
+policy_id = "loaded"
+tools = ["http"]
+memory_view = "none"
+"#,
+        )
+        .expect("write subagent config");
+        std::fs::write(
+            root.join("suborchs").join("loaded.toml"),
+            r#"
+name = "loaded-template"
+stages = [
+  { name = "stage", agent_id = "loaded-agent", policy_id = "loaded" },
+]
+"#,
+        )
+        .expect("write template config");
+
+        let config = WorkspaceConfig::load(&root.join("agent.toml")).expect("load config");
+
+        assert_eq!(config.agent.max_turns, 9);
+        assert_eq!(config.policy.default.as_ref(), "ask_user");
+        assert!(config.channels.telegram.enabled);
+        assert_eq!(
+            config.resources.tools.enabled,
+            vec![Arc::from("file"), Arc::from("memory")]
+        );
+        assert_eq!(config.resources.mcp.enabled, vec![Arc::from("remote_echo")]);
+        assert_eq!(config.resources.llm.enabled, vec![Arc::from("llm")]);
+        assert_eq!(config.task_workspace.root, root.join("tasks"));
+        assert_eq!(config.subagents.len(), 1);
+        assert_eq!(config.subagents[0].name.as_ref(), "loaded-agent");
+        assert_eq!(config.orchestrator_templates.len(), 1);
+        assert_eq!(
+            config.orchestrator_templates[0].name.as_ref(),
+            "loaded-template"
+        );
+
+        std::fs::remove_dir_all(root).expect("remove temp config dir");
+    }
+
+    #[test]
+    fn invalid_inert_config_keys_are_rejected_when_known() {
+        let mut config = WorkspaceConfig::default();
+        config.policy.default = Arc::from("maybe");
+        assert!(config.validate_policy().is_err());
+
+        config.policy.default = Arc::from("deny");
+        config.channels.telegram.enabled = true;
+        config.channels.telegram.mode = Arc::from("webhook");
+        assert!(config.validate_channels().is_err());
+
+        config.channels.telegram.mode = Arc::from("poll_once");
+        config.resources.llm.enabled = vec![Arc::from("gpt-other")];
+        assert!(config.validate_resources().is_err());
+    }
+
+    #[test]
+    fn repository_workspace_config_declares_effective_resources() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config = WorkspaceConfig::load(&repo_root.join("workspace/agent.toml"))
+            .expect("load workspace config");
+
+        assert_eq!(config.agent.max_turns, 16);
+        assert_eq!(config.policy.default.as_ref(), "deny");
+        assert!(config.channels.tui.enabled);
+        assert!(!config.channels.telegram.enabled);
+        assert!(!config.channels.feishu.enabled);
+        assert_eq!(
+            config.resources.skills.enabled,
+            vec![
+                Arc::from("skill-creator"),
+                Arc::from("web-research"),
+                Arc::from("audit-skill"),
+            ]
+        );
+        assert_eq!(
+            config.resources.tools.enabled,
+            vec![
+                Arc::from("file"),
+                Arc::from("http"),
+                Arc::from("memory"),
+                Arc::from("shell"),
+                Arc::from("skill_validate"),
+                Arc::from("cron_create"),
+                Arc::from("cron_list"),
+                Arc::from("cron_remove"),
+            ]
+        );
+        assert_eq!(config.resources.mcp.enabled, vec![Arc::from("remote_echo")]);
+        assert_eq!(config.resources.llm.enabled, vec![Arc::from("llm")]);
+        assert_eq!(
+            config
+                .routing_table()
+                .expect("routing table")
+                .fallback
+                .dispatch,
+            agentos_interfaces::orchestrator::DispatchTarget::Direct
+        );
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("{prefix}-{}", std::process::id()))
     }
 }

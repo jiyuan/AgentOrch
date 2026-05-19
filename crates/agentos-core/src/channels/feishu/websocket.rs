@@ -20,7 +20,9 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::Request;
 use tokio_tungstenite::tungstenite::protocol::Message;
-use tokio_tungstenite::{client_async_tls, connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    client_async, client_async_tls, connect_async, MaybeTlsStream, WebSocketStream,
+};
 use tracing::warn;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -32,10 +34,7 @@ pub(super) struct WebSocketConnection {
 impl WebSocketConnection {
     pub(super) async fn connect(url: &str) -> Result<Self, ChannelError> {
         let target = TargetUrl::parse(url)?;
-        let proxy = target
-            .tls
-            .then(|| https_proxy_for_target(&target.host))
-            .flatten();
+        let proxy = https_proxy_for_target(&target.host);
 
         let stream = match proxy {
             Some(proxy) => connect_via_proxy(&proxy, &target).await?,
@@ -160,7 +159,12 @@ async fn connect_via_proxy(proxy: &Proxy, target: &TargetUrl) -> Result<WsStream
                     "Feishu WebSocket URL is not a valid request: {err}"
                 )))
             })?;
-    let (stream, _response) = client_async_tls(request, tunneled).await.map_err(|err| {
+    let (stream, _response) = if target.tls {
+        client_async_tls(request, tunneled).await
+    } else {
+        client_async(request, MaybeTlsStream::Plain(tunneled)).await
+    }
+    .map_err(|err| {
         ChannelError::Backend(Arc::from(format!(
             "Feishu WebSocket tunnelled handshake failed: {err}"
         )))
@@ -172,16 +176,18 @@ async fn connect_via_proxy(proxy: &Proxy, target: &TargetUrl) -> Result<WsStream
 struct TargetUrl {
     host: String,
     port: u16,
+    /// Whether the endpoint uses TLS (`wss://`). Plain `ws://` is accepted so
+    /// the channel can talk to a local mock long-connection server in tests.
     tls: bool,
     original_url: String,
 }
 
 impl TargetUrl {
     fn parse(url: &str) -> Result<Self, ChannelError> {
-        let (rest, tls, default_port) = if let Some(rest) = url.strip_prefix("wss://") {
-            (rest, true, 443)
+        let (rest, tls) = if let Some(rest) = url.strip_prefix("wss://") {
+            (rest, true)
         } else if let Some(rest) = url.strip_prefix("ws://") {
-            (rest, false, 80)
+            (rest, false)
         } else {
             return Err(ChannelError::Backend(Arc::from(
                 "Feishu WebSocket URL must use ws:// or wss://",
@@ -200,7 +206,7 @@ impl TargetUrl {
                 })?;
                 (host.to_owned(), parsed)
             }
-            None => (authority.to_owned(), default_port),
+            None => (authority.to_owned(), if tls { 443 } else { 80 }),
         };
         Ok(Self {
             host,
@@ -367,16 +373,23 @@ mod tests {
     }
 
     #[test]
-    fn target_url_accepts_plain_ws_for_local_mocks() {
-        let parsed = TargetUrl::parse("ws://example.com/events").unwrap();
-        assert_eq!(parsed.host, "example.com");
+    fn target_url_accepts_plain_ws_for_mocks() {
+        let parsed = TargetUrl::parse("ws://127.0.0.1:9001/feishu").unwrap();
+        assert_eq!(parsed.host, "127.0.0.1");
+        assert_eq!(parsed.port, 9001);
+        assert!(!parsed.tls);
+    }
+
+    #[test]
+    fn target_url_defaults_ws_port_to_80() {
+        let parsed = TargetUrl::parse("ws://example.com/path").unwrap();
         assert_eq!(parsed.port, 80);
         assert!(!parsed.tls);
     }
 
     #[test]
-    fn target_url_rejects_non_websocket_scheme() {
-        assert!(TargetUrl::parse("http://example.com").is_err());
+    fn target_url_rejects_non_ws_scheme() {
+        assert!(TargetUrl::parse("https://example.com").is_err());
     }
 
     #[test]

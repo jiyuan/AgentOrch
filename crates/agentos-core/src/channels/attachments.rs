@@ -1,19 +1,17 @@
 //! Filesystem layout for inbound channel attachments.
 //!
-//! Channels download user-supplied files into `workspace/attachments/
-//! <channel>/<conversation>/<message_id>/<name>` so downstream orchestrators
-//! and tools can read them without needing channel-specific auth.
+//! Channels download user-supplied files into an injected attachments root using
+//! `<channel>/<conversation>/<message_id>/<name>` beneath that root, so
+//! downstream orchestrators and tools can read them without needing
+//! channel-specific auth.
 //!
-//! The root is overridable with `AGENTOS_ATTACHMENTS_DIR` to keep tests off
-//! the real workspace.
+//! Production callers should pass the root chosen by their runtime path layer.
+//! `AGENTOS_ATTACHMENTS_DIR` remains as a standalone fallback and test override.
 
 use agentos_interfaces::ChannelError;
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-const DEFAULT_ATTACHMENTS_DIR: &str = "workspace/attachments";
 
 pub(crate) struct AttachmentStore {
     root: PathBuf,
@@ -22,11 +20,19 @@ pub(crate) struct AttachmentStore {
 
 impl AttachmentStore {
     pub(crate) fn from_env(channel: &str) -> Self {
-        let root = env::var("AGENTOS_ATTACHMENTS_DIR")
+        let root = std::env::var("AGENTOS_ATTACHMENTS_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(DEFAULT_ATTACHMENTS_DIR));
+            .unwrap_or_else(|_| {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join("attachments")
+            });
+        Self::new(root, channel)
+    }
+
+    pub(crate) fn new(root: impl Into<PathBuf>, channel: &str) -> Self {
         Self {
-            root,
+            root: root.into(),
             channel: channel.to_owned(),
         }
     }
@@ -101,6 +107,7 @@ fn sanitize_filename(input: &str) -> Arc<str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());

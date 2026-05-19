@@ -5,6 +5,7 @@ use agentos_proto::{ToolCall, ToolResult, ToolStatus};
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, value::RawValue};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -74,11 +75,21 @@ impl Tool for SkillValidateTool {
         match outcome {
             Ok(skill) => {
                 let canonical = skill_dir.canonicalize().unwrap_or(skill_dir.clone());
+                let inventory =
+                    bundle_inventory(&skill_dir).unwrap_or_else(|err| vec![format!("{err}")]);
+                let inventory = inventory
+                    .iter()
+                    .map(|entry| format!("  - {entry}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 let message = format!(
-                    "skill_validate: PASS — '{}' at {} (description: \"{}\")",
+                    "skill_validate: PASS — '{}' at {} (description: \"{}\")\n\
+                     bundle_inventory:\n{}\n\
+                     note: PASS confirms SKILL.md structure only; ensure the listed bundle files satisfy the requested workflow before final response.",
                     skill.name,
                     canonical.display(),
-                    skill.description
+                    skill.description,
+                    inventory
                 );
                 tracing::info!(
                     tool = "skill_validate",
@@ -162,6 +173,39 @@ fn format_validation_failure(
     )
 }
 
+fn bundle_inventory(skill_dir: &Path) -> Result<Vec<String>, String> {
+    let mut entries = Vec::new();
+    collect_bundle_files(skill_dir, skill_dir, &mut entries)?;
+    entries.sort();
+    if entries.is_empty() {
+        entries.push("(no files found)".to_owned());
+    }
+    Ok(entries)
+}
+
+fn collect_bundle_files(root: &Path, dir: &Path, entries: &mut Vec<String>) -> Result<(), String> {
+    let read_dir = std::fs::read_dir(dir)
+        .map_err(|err| format!("bundle inventory unavailable at {}: {err}", dir.display()))?;
+    for entry in read_dir {
+        let entry = entry
+            .map_err(|err| format!("bundle inventory read failed at {}: {err}", dir.display()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_bundle_files(root, &path, entries)?;
+        } else if path.is_file() {
+            entries.push(relative_bundle_path(root, &path));
+        }
+    }
+    Ok(())
+}
+
+fn relative_bundle_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::common::test_support::{tool_call, SkillsDirGuard};
@@ -191,6 +235,36 @@ mod tests {
             result.content
         );
         assert!(result.content.contains("good-skill"));
+        assert!(result.content.contains("bundle_inventory"));
+        assert!(result.content.contains("SKILL.md"));
+        assert!(result.content.contains("structure only"));
+    }
+
+    #[tokio::test]
+    async fn skill_validate_reports_bundle_inventory() {
+        let guard = SkillsDirGuard::new("skill-validate-inventory");
+        let skill_dir = guard.dir.join("bundle-skill");
+        std::fs::create_dir_all(skill_dir.join("scripts")).unwrap();
+        std::fs::create_dir_all(skill_dir.join("references")).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: bundle-skill\ndescription: A valid bundle skill.\n---\n\n# Bundle Skill\n\nUse scripts/run.py and references/schema.md.\n",
+        )
+        .unwrap();
+        std::fs::write(skill_dir.join("scripts/run.py"), "print('ok')\n").unwrap();
+        std::fs::write(skill_dir.join("references/schema.md"), "# Schema\n").unwrap();
+
+        let args = json!({ "name": "bundle-skill" });
+        let raw = RawValue::from_string(args.to_string()).unwrap();
+        let result = SkillValidateTool
+            .call(&tool_call("skill_validate", "inventory"), &raw)
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, ToolStatus::Succeeded);
+        assert!(result.content.contains("  - SKILL.md"));
+        assert!(result.content.contains("  - references/schema.md"));
+        assert!(result.content.contains("  - scripts/run.py"));
     }
 
     #[tokio::test]

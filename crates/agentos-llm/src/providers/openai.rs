@@ -2,10 +2,13 @@ use crate::providers::content::{
     append_descriptors, document_mime, format_text_document, image_mime, read_base64,
     read_text_document,
 };
-use crate::providers::{first_env, format_openai_error, post_json};
+use crate::providers::{
+    attach_token_usage, first_env, format_openai_error, log_token_usage, post_json,
+};
 use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::{Attachment, AttachmentKind, Message, MessageRole, ToolCall, ToolCallId};
 use serde_json::{json, value::RawValue, Value};
+use std::collections::BTreeSet;
 use std::env;
 use std::sync::Arc;
 
@@ -28,7 +31,7 @@ pub async fn complete(
     if let Some(project) = first_env(["OPENAI_PROJECT", "OPENAI_PROJECT_ID"]) {
         headers.push(("OpenAI-Project", project));
     }
-    let serialized = messages.iter().map(build_message).collect::<Vec<_>>();
+    let serialized = serialize_messages(messages);
     let mut payload = json!({
         "model": model,
         "messages": serialized,
@@ -49,6 +52,7 @@ pub async fn complete(
     if let Some(error) = response.body.get("error") {
         return Err(format_openai_error(&response, error));
     }
+    let token_usage = log_token_usage("openai", model, &response.body);
     let message = response
         .body
         .get("choices")
@@ -62,14 +66,18 @@ pub async fn complete(
         .unwrap_or("")
         .to_owned();
     let tool_calls = parse_tool_calls(message);
-    Ok(Message {
+    let mut message = Message {
         role: MessageRole::Assistant,
         content: Arc::from(content),
         attachments: Vec::new(),
         tool_calls,
         tool_call_id: None,
         metadata: Default::default(),
-    })
+    };
+    if let Some(usage) = token_usage {
+        attach_token_usage(&mut message, usage);
+    }
+    Ok(message)
 }
 
 fn tool_to_function(spec: &ToolSpec) -> Value {
@@ -196,6 +204,55 @@ fn build_message(message: &Message) -> Value {
         "role": role,
         "content": blocks,
     })
+}
+
+fn serialize_messages(messages: &[Message]) -> Vec<Value> {
+    let mut pending_tool_call_ids = BTreeSet::new();
+    let mut serialized = Vec::with_capacity(messages.len());
+    for message in messages {
+        match message.role {
+            MessageRole::Assistant if !message.tool_calls.is_empty() => {
+                pending_tool_call_ids.clear();
+                pending_tool_call_ids.extend(
+                    message
+                        .tool_calls
+                        .iter()
+                        .map(|call| call.id.as_str().to_owned()),
+                );
+                serialized.push(build_message(message));
+            }
+            MessageRole::Tool => {
+                let paired = message
+                    .tool_call_id
+                    .as_ref()
+                    .is_some_and(|id| pending_tool_call_ids.remove(id.as_str()));
+                if paired {
+                    serialized.push(build_message(message));
+                } else {
+                    pending_tool_call_ids.clear();
+                    serialized.push(orphan_tool_message_as_user(message));
+                }
+            }
+            _ => {
+                pending_tool_call_ids.clear();
+                serialized.push(build_message(message));
+            }
+        }
+    }
+    serialized
+}
+
+fn orphan_tool_message_as_user(message: &Message) -> Value {
+    let kind = message
+        .metadata
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("tool_result");
+    let content = format!(
+        "Internal AgentOS observation ({kind}):\n{}",
+        message.content.as_ref()
+    );
+    json!({ "role": "user", "content": content })
 }
 
 fn serialize_tool_call(call: &ToolCall) -> Value {
@@ -472,6 +529,68 @@ mod tests {
         assert_eq!(value["role"], "tool");
         assert_eq!(value["tool_call_id"], "call_1");
         assert_eq!(value["content"], "wrote 42 bytes");
+    }
+
+    #[test]
+    fn paired_tool_result_stays_tool_role() {
+        let call = ToolCall {
+            id: ToolCallId::new("call_1"),
+            name: Arc::from("file"),
+            args: raw_args(r#"{"operation":"write","path":"hi.txt"}"#),
+        };
+        let messages = vec![
+            Message {
+                role: MessageRole::Assistant,
+                content: Arc::from(""),
+                attachments: Vec::new(),
+                tool_calls: vec![call],
+                tool_call_id: None,
+                metadata: Default::default(),
+            },
+            Message {
+                role: MessageRole::Tool,
+                content: Arc::from("wrote 42 bytes"),
+                attachments: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some(ToolCallId::new("call_1")),
+                metadata: Default::default(),
+            },
+        ];
+
+        let serialized = serialize_messages(&messages);
+
+        assert_eq!(serialized[0]["role"], "assistant");
+        assert_eq!(serialized[1]["role"], "tool");
+        assert_eq!(serialized[1]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn orphan_tool_result_becomes_user_context() {
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert(
+            Arc::from("kind"),
+            Value::String("subagent_result".to_owned()),
+        );
+        let messages = vec![
+            Message::text(MessageRole::User, "call audit-skill"),
+            Message {
+                role: MessageRole::Tool,
+                content: Arc::from("audit-skill completed"),
+                attachments: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                metadata,
+            },
+        ];
+
+        let serialized = serialize_messages(&messages);
+
+        assert_eq!(serialized[0]["role"], "user");
+        assert_eq!(serialized[1]["role"], "user");
+        let content = serialized[1]["content"].as_str().unwrap();
+        assert!(content.contains("Internal AgentOS observation (subagent_result)"));
+        assert!(content.contains("audit-skill completed"));
+        assert!(serialized[1].get("tool_call_id").is_none());
     }
 
     #[test]

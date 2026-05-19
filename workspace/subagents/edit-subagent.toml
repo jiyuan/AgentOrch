@@ -1,9 +1,10 @@
 name = "edit-subagent"
 id = "edit-subagent"
-description = "Handles narrow editing tasks with file access."
+description = "Handles narrow prose editing tasks with file access. Does not handle skill-bundle operations."
 developer_instructions = """
 Make focused edits only.
 Preserve unrelated content.
+Do not edit, rebuild, or validate skill bundles. Any request that touches `workspace/skills/<name>/SKILL.md` or its scripts belongs to the skill-editor sub-agent via the skill_ops route — report that the request needs re-routing instead of attempting it here.
 Report the changed files and verification performed.
 """
 policy_id = "edit"

@@ -8,8 +8,6 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-const REPLY_PREFIX_METADATA_KEY: &str = "gateway_reply_prefix";
-
 #[derive(Debug, Error)]
 pub enum GatewayError {
     #[error("channel failed: {0}")]
@@ -83,18 +81,16 @@ impl<'a> GatewayService<'a> {
     pub async fn run_envelope<C>(
         &self,
         channel: &C,
-        mut input: Envelope,
+        input: Envelope,
         run_id: RunId,
     ) -> Result<GatewayRun, GatewayError>
     where
         C: Channel,
     {
-        let reply_prefix = extract_reply_prefix(&mut input);
         let channel_id = input.channel_id.clone();
         let conversation_id = input.conversation_id.clone();
         match run_envelope(input, run_id, self.deps).await? {
-            RunOutcome::Finished { state, mut output } => {
-                apply_reply_prefix_value(&mut output, reply_prefix.as_deref());
+            RunOutcome::Finished { state, output } => {
                 channel.send(output.clone()).await?;
                 Ok(GatewayRun::Finished { state, output })
             }
@@ -104,8 +100,7 @@ impl<'a> GatewayService<'a> {
                     conversation_id,
                     state,
                 };
-                self.send_approval_prompt(channel, paused, reply_prefix)
-                    .await
+                self.send_approval_prompt(channel, paused).await
             }
         }
     }
@@ -120,12 +115,10 @@ impl<'a> GatewayService<'a> {
     where
         C: Channel,
     {
-        let reply_prefix = reply_prefix_from_state(&paused.state);
         let channel_id = paused.channel_id.clone();
         let conversation_id = paused.conversation_id.clone();
         match resume_run(paused, approval_id, decision, self.deps).await? {
-            RunOutcome::Finished { state, mut output } => {
-                apply_reply_prefix_value(&mut output, reply_prefix.as_deref());
+            RunOutcome::Finished { state, output } => {
                 channel.send(output.clone()).await?;
                 Ok(GatewayRun::Finished { state, output })
             }
@@ -135,8 +128,7 @@ impl<'a> GatewayService<'a> {
                     conversation_id,
                     state,
                 };
-                self.send_approval_prompt(channel, paused, reply_prefix)
-                    .await
+                self.send_approval_prompt(channel, paused).await
             }
         }
     }
@@ -145,107 +137,14 @@ impl<'a> GatewayService<'a> {
         &self,
         channel: &C,
         paused: PausedRun,
-        reply_prefix: Option<Arc<str>>,
     ) -> Result<GatewayRun, GatewayError>
     where
         C: Channel,
     {
-        let mut prompt = approval_prompt_envelope(&paused, Arc::clone(&self.sender));
-        if let Some(prompt) = &mut prompt {
-            apply_reply_prefix_value(prompt, reply_prefix.as_deref());
+        let prompt = approval_prompt_envelope(&paused, Arc::clone(&self.sender));
+        if let Some(prompt) = &prompt {
             channel.send(prompt.clone()).await?;
         }
         Ok(GatewayRun::Paused { paused, prompt })
-    }
-}
-
-pub fn extract_reply_prefix(env: &mut Envelope) -> Option<Arc<str>> {
-    let content = env.message.content.as_ref();
-    let prefix_end = task_prefix_end(content)?;
-    let prefix: Arc<str> = Arc::from(content[..prefix_end].to_owned());
-    let stripped = content[prefix_end..].trim_start();
-    env.message.content = Arc::from(stripped.to_owned());
-    env.metadata.insert(
-        Arc::from(REPLY_PREFIX_METADATA_KEY),
-        serde_json::Value::String(prefix.as_ref().to_owned()),
-    );
-    Some(prefix)
-}
-
-pub fn apply_reply_prefix(env: &mut Envelope) {
-    let Some(prefix) = env
-        .metadata
-        .get(REPLY_PREFIX_METADATA_KEY)
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned)
-    else {
-        return;
-    };
-    apply_reply_prefix_value(env, Some(&prefix));
-}
-
-fn apply_reply_prefix_value(env: &mut Envelope, prefix: Option<&str>) {
-    let Some(prefix) = prefix else {
-        return;
-    };
-    if env.message.content.starts_with(prefix) {
-        return;
-    }
-    env.message.content = Arc::from(format!("{prefix} {}", env.message.content));
-}
-
-fn reply_prefix_from_state(state: &RunState) -> Option<Arc<str>> {
-    state.transcript.items.iter().rev().find_map(|item| {
-        item.metadata
-            .get(REPLY_PREFIX_METADATA_KEY)
-            .and_then(serde_json::Value::as_str)
-            .map(|prefix| Arc::from(prefix.to_owned()))
-    })
-}
-
-fn task_prefix_end(content: &str) -> Option<usize> {
-    let rest = content.strip_prefix("[task:")?;
-    let id_end = rest.find(']')?;
-    let id = &rest[..id_end];
-    if id.is_empty()
-        || !id
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
-    {
-        return None;
-    }
-    Some("[task:".len() + id_end + 1)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use agentos_proto::{ChannelId, ConversationId, Message, MessageRole};
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn task_prefix_is_stripped_from_input_and_restored_on_reply() {
-        let mut input = Envelope {
-            channel_id: ChannelId::new("telegram"),
-            conversation_id: ConversationId::new("chat"),
-            sender: Arc::from("user"),
-            message: Message::text(MessageRole::User, "[task:abc_123] /help"),
-            metadata: BTreeMap::new(),
-        };
-
-        let prefix = extract_reply_prefix(&mut input).expect("prefix");
-        assert_eq!(prefix.as_ref(), "[task:abc_123]");
-        assert_eq!(input.message.content.as_ref(), "/help");
-
-        let mut output = Envelope {
-            channel_id: input.channel_id.clone(),
-            conversation_id: input.conversation_id.clone(),
-            sender: Arc::from("assistant"),
-            message: Message::text(MessageRole::Assistant, "help text"),
-            metadata: input.metadata.clone(),
-        };
-        apply_reply_prefix(&mut output);
-
-        assert_eq!(output.message.content.as_ref(), "[task:abc_123] help text");
     }
 }

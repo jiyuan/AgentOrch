@@ -1,6 +1,8 @@
-use crate::approve::{Policy, PolicyAction, PolicyRule, PolicyVerb};
-use crate::config::{SubAgentConfig, TemplateConfig, WorkspaceConfig};
-use crate::guardrails::{MaxOutputLength, PiiFilter, ShellCommandAllowlist};
+use crate::approve::Policy;
+use crate::config::{SubAgentConfig, WorkspaceConfig};
+use crate::guardrails::{
+    MaxOutputLength, PiiFilter, ShellCommandAllowlist, SkillBundleWriteGuardrail,
+};
 use crate::memory::{
     InMemoryMemory, MemoryManager, QdrantSemanticIndex, SqliteStore, SqliteVecSemanticIndex,
 };
@@ -12,10 +14,7 @@ use crate::runner::{JsonlTraceSink, RunnerDeps, TraceSink};
 use crate::skills::WorkspaceSkillCatalog;
 use crate::subagents::{SubAgentDefinition, SubAgentRegistry};
 use crate::task_workspace::TaskWorkspace;
-use crate::tools::{
-    CronCreatorTool, CronListTool, CronRemoveTool, FileTool, HttpTool, MemoryTool, ShellTool,
-    SkillValidateTool, StaticMcpClient, StaticMcpTool, StdioMcpClient, ToolRegistry,
-};
+use crate::tools::{MemoryTool, StaticMcpClient, StaticMcpTool, StdioMcpClient, ToolRegistry};
 use agentos_interfaces::mcp::{McpClient, McpServer};
 use agentos_interfaces::orchestrator::{
     Orchestrator, OrchestratorError, Plan, ResourceIndex, RunContext,
@@ -24,14 +23,21 @@ use agentos_interfaces::tool::ToolSpec;
 use agentos_llm::{EnvLlm, LlmModelController, LlmModelTier};
 use agentos_proto::AgentId;
 use async_trait::async_trait;
-use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+
+mod tools_config;
+
+use tools_config::{build_parent_tools, subagent_memory_tool_enabled, subagent_policy};
+pub use tools_config::{phase5_policy, register_builtin_tool};
+
+const DEFAULT_SHELL_ALLOWLIST: [&str; 8] =
+    ["printf", "echo", "pwd", "ls", "find", "cat", "head", "tail"];
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -44,6 +50,9 @@ pub struct RuntimePaths {
     pub agent_config_path: PathBuf,
     pub session_db_path: PathBuf,
     pub trace_dir: PathBuf,
+    pub workspace_root: PathBuf,
+    pub skills_dir: PathBuf,
+    pub cron_dir: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -173,35 +182,39 @@ impl AgentRuntime {
                 .map_err(|err| format!("failed to open session store: {err}"))?,
         );
         let memory_manager = build_memory_manager(&workspace_config, session.clone())?;
-        let mut tools = ToolRegistry::reference_with_memory_manager(memory_manager.clone());
+        let mut tools = build_parent_tools(&workspace_config, memory_manager.clone())?;
         if let Some(path) = isolation_worker_path(&workspace_config) {
             tools = tools.with_subprocess_isolation(path);
         }
         let mcp_specs = register_configured_mcp(&mut tools, &workspace_config).await?;
         let model_controller = LlmModelController::new();
+        let resolved_workspace_root = absolutise(&paths.workspace_root);
+        std::env::set_var("AGENTOS_WORKSPACE_ROOT", &resolved_workspace_root);
         // Skill catalog must be loaded before sub-agents are built so sub-agent
         // MaxOrchestrators can hold a clone of it and dispatch skills (e.g.
         // web-research, skill-creator).
         //
         // Resolve to an absolute path so the skills root is independent of
         // the gateway process's CWD. If the gateway was launched with a
-        // relative --config (the default is `workspace/agent.toml`), then
-        // `skills_root` returns a relative path, and every later `fs::write`
+        // relative --config (the default is `workspace/agent.toml`), then every
+        // later `fs::write`
         // call resolves it against whatever CWD the gateway happened to
         // inherit. The user looking at the workspace from a shell with a
         // different CWD would then see an empty/missing directory while the
         // tool reports success. Anchor on CWD-at-startup once and use that
         // resolved absolute path everywhere downstream.
-        let resolved_skills_root = absolutise(&skills_root(&paths.agent_config_path));
+        let resolved_skills_root = absolutise(&paths.skills_dir);
         // Pin `AGENTOS_SKILLS_DIR` to the same absolute path the loader uses,
         // so the `skill_create` tool's `default_skills_dir` resolves to the
-        // same directory regardless of the gateway process's CWD.
-        if std::env::var_os("AGENTOS_SKILLS_DIR").is_none() {
-            std::env::set_var("AGENTOS_SKILLS_DIR", &resolved_skills_root);
-        }
+        // same directory regardless of the gateway process's CWD or ambient env.
+        std::env::set_var("AGENTOS_SKILLS_DIR", &resolved_skills_root);
+        let resolved_cron_dir = absolutise(&paths.cron_dir);
+        std::env::set_var("AGENTOS_CRON_DIR", &resolved_cron_dir);
         tracing::info!(
+            workspace_root = %resolved_workspace_root.display(),
             skills_root = %resolved_skills_root.display(),
-            "skills root resolved"
+            cron_dir = %resolved_cron_dir.display(),
+            "runtime paths resolved"
         );
         probe_skills_root(&resolved_skills_root)
             .map_err(|err| format!("skills root write probe failed: {err}"))?;
@@ -261,7 +274,7 @@ impl AgentRuntime {
             task_workspace,
             pii_filter: PiiFilter,
             max_output_length: MaxOutputLength::new(64_000),
-            shell_allowlist: ShellCommandAllowlist::new(["printf", "echo", "pwd", "ls"]),
+            shell_allowlist: ShellCommandAllowlist::new(DEFAULT_SHELL_ALLOWLIST),
         })
     }
 
@@ -270,18 +283,11 @@ impl AgentRuntime {
     }
 }
 
-pub fn skills_root(agent_config_path: &Path) -> PathBuf {
-    agent_config_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("skills")
-}
-
 /// Resolve `path` to an absolute path against the process CWD at the moment
-/// of the call. Used at startup so the skills root the runtime hands to the
-/// `skill_create` tool is CWD-independent. Falls back to the input path if
-/// `current_dir` fails (e.g. CWD was unlinked) — in that pathological case
-/// we'd rather keep going than refuse to start.
+/// of the call. Used at startup so runtime-owned roots handed to tools are
+/// CWD-independent. Falls back to the input path if `current_dir` fails (e.g.
+/// CWD was unlinked) — in that pathological case we'd rather keep going than
+/// refuse to start.
 fn absolutise(path: &Path) -> PathBuf {
     if path.is_absolute() {
         return path.to_path_buf();
@@ -301,7 +307,17 @@ fn absolutise(path: &Path) -> PathBuf {
 fn probe_skills_root(root: &Path) -> Result<(), String> {
     std::fs::create_dir_all(root)
         .map_err(|err| format!("cannot create skills root '{}': {err}", root.display()))?;
-    let probe = root.join(format!(".agentos-probe-{}", std::process::id()));
+    // The filename must be unique per probe call, not just per process: the
+    // gateway runs one `AgentRuntime::build` per channel concurrently in the
+    // same process, so a process-id-only name lets one thread's `remove_file`
+    // delete another thread's probe and the loser fails with ENOENT. Mix in a
+    // monotonic counter so concurrent builds never collide.
+    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let probe = root.join(format!(
+        ".agentos-probe-{}-{}",
+        std::process::id(),
+        PROBE_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::write(&probe, b"agentos skills root probe")
         .map_err(|err| format!("cannot write to skills root '{}': {err}", root.display()))?;
     let metadata = std::fs::metadata(&probe).map_err(|err| {
@@ -331,80 +347,7 @@ fn probe_skills_root(root: &Path) -> Result<(), String> {
 }
 
 pub fn load_workspace_config(path: &Path) -> Result<WorkspaceConfig, std::io::Error> {
-    let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut config = match std::fs::read_to_string(path) {
-        Ok(input) => toml::from_str(&input).map_err(std::io::Error::other)?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => WorkspaceConfig::default(),
-        Err(err) => return Err(err),
-    };
-    resolve_workspace_paths(&mut config, config_dir);
-    config.validate_memory().map_err(std::io::Error::other)?;
-    config.subagents.extend(load_subagent_files(config_dir)?);
-    config
-        .orchestrator_templates
-        .extend(load_suborch_files(config_dir)?);
-    config.validate_subagents().map_err(std::io::Error::other)?;
-    config.routing_table().map_err(std::io::Error::other)?;
-    Ok(config)
-}
-
-fn resolve_workspace_paths(config: &mut WorkspaceConfig, config_dir: &Path) {
-    if let Some(path) = &config.memory.path {
-        if path.is_relative() {
-            config.memory.path = Some(config_dir.join(path));
-        }
-    }
-    if config.task_workspace.root.is_relative() {
-        config.task_workspace.root = config_dir.join(&config.task_workspace.root);
-    }
-    if let Some(worker_path) = &config.isolation.worker_path {
-        if worker_path.is_relative() {
-            config.isolation.worker_path = Some(config_dir.join(worker_path));
-        }
-    }
-}
-
-fn load_subagent_files(config_dir: &Path) -> Result<Vec<SubAgentConfig>, std::io::Error> {
-    let mut files = workspace_toml_files(&config_dir.join("subagents"))?;
-    files
-        .drain(..)
-        .map(|path| {
-            let input = std::fs::read_to_string(&path)?;
-            let mut subagent: SubAgentConfig =
-                toml::from_str(&input).map_err(std::io::Error::other)?;
-            if subagent.name.is_empty() {
-                subagent.name = Arc::clone(&subagent.id);
-            }
-            Ok(subagent)
-        })
-        .collect()
-}
-
-fn load_suborch_files(config_dir: &Path) -> Result<Vec<TemplateConfig>, std::io::Error> {
-    let mut files = workspace_toml_files(&config_dir.join("suborchs"))?;
-    files
-        .drain(..)
-        .map(|path| {
-            let input = std::fs::read_to_string(&path)?;
-            toml::from_str(&input).map_err(std::io::Error::other)
-        })
-        .collect()
-}
-
-fn workspace_toml_files(root: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
-    let entries = match std::fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err),
-    };
-    let mut files = entries
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
-        .collect::<Vec<_>>();
-    files.sort();
-    Ok(files)
+    WorkspaceConfig::load(path)
 }
 
 fn build_memory_manager(
@@ -458,7 +401,7 @@ impl<'a> RuntimeDepsScope<'a> {
             session: self.runtime.session.as_ref(),
             memory_manager: self.episode_memory_manager(),
             hooks: None,
-            max_turns: 4,
+            max_turns: main_max_turns(&self.runtime.workspace_config),
             active_agent: self.runtime.active_agent.clone(),
             tools: Some(&self.runtime.tools),
             trace_sink: Some(self.runtime.trace_sink.as_ref()),
@@ -503,7 +446,7 @@ impl<'a> RuntimeDepsScope<'a> {
             session: self.runtime.session.as_ref(),
             memory_manager: self.episode_memory_manager(),
             hooks: None,
-            max_turns: 4,
+            max_turns: main_max_turns(&self.runtime.workspace_config),
             active_agent: self.runtime.active_agent.clone(),
             tools: Some(&self.runtime.tools),
             trace_sink: Some(self.runtime.trace_sink.as_ref()),
@@ -545,7 +488,7 @@ pub fn build_subagents(
         let mut tools = ToolRegistry::new();
         for tool in &subagent.tools {
             if tool.as_ref() != "memory" {
-                register_builtin_tool(&mut tools, tool);
+                register_builtin_tool(&mut tools, tool)?;
             }
         }
         if subagent_memory_tool_enabled(subagent) {
@@ -610,8 +553,15 @@ pub fn build_subagents(
                 )
                 .with_tool_guardrail(
                     "ShellCommandAllowlist",
-                    ShellCommandAllowlist::new(["printf", "echo", "pwd", "ls"]),
+                    ShellCommandAllowlist::new(DEFAULT_SHELL_ALLOWLIST),
                 );
+        }
+        // The skill-bundle write boundary is a hard permission gate, not an
+        // inherited convenience: it applies even when `inherit_guardrails`
+        // is off, and only the designated skill editor opts out of it.
+        if !subagent.skill_bundle_writer {
+            definition = definition
+                .with_tool_guardrail("SkillBundleWriteGuardrail", SkillBundleWriteGuardrail);
         }
         registry.register(definition);
     }
@@ -636,9 +586,16 @@ pub async fn register_configured_mcp(
     tools: &mut ToolRegistry,
     config: &WorkspaceConfig,
 ) -> Result<Vec<ToolSpec>, String> {
-    if config.mcp_servers.is_empty() {
+    if config.mcp_servers.is_empty() || config.resources.mcp.enabled.is_empty() {
         return Ok(Vec::new());
     }
+    let enabled_mcp = config
+        .resources
+        .mcp
+        .enabled
+        .iter()
+        .map(Arc::clone)
+        .collect::<BTreeSet<_>>();
 
     let static_client = Arc::new(StaticMcpClient::new(config.mcp_tools.iter().map(|tool| {
         StaticMcpTool {
@@ -674,120 +631,33 @@ pub async fn register_configured_mcp(
             };
         specs.extend(
             tools
-                .register_mcp_server(
+                .register_mcp_server_filtered(
                     McpServer {
                         id: Arc::clone(&server.id),
                         endpoint: Arc::clone(&server.endpoint),
                     },
                     client,
+                    |spec| enabled_mcp.contains(&spec.name),
                 )
                 .await
                 .map_err(|err| format!("failed to register MCP server {}: {err}", server.id))?,
         );
     }
-    Ok(specs)
-}
-
-pub fn phase5_policy(config: &WorkspaceConfig, mcp_specs: &[ToolSpec]) -> Policy {
-    let mut policy = Policy::phase4_reference();
-    if !config.subagents.is_empty() {
-        policy.rules.push(PolicyRule {
-            action: PolicyAction::Delegate,
-            decision: PolicyVerb::Allow,
-            reason: None,
-            arg_equals: BTreeMap::new(),
-        });
-    }
-    if !config.orchestrator_templates.is_empty() {
-        policy.rules.push(PolicyRule {
-            action: PolicyAction::Escalate,
-            decision: PolicyVerb::Allow,
-            reason: None,
-            arg_equals: BTreeMap::new(),
-        });
-    }
-    for subagent in &config.subagents {
-        for tool in &subagent.tools {
-            allow_tool_once(&mut policy, Arc::clone(tool));
-        }
-    }
-    for spec in mcp_specs {
-        allow_tool_once(&mut policy, Arc::clone(&spec.name));
-    }
-    policy
-}
-
-fn subagent_policy(subagent: &SubAgentConfig) -> Result<Policy, String> {
-    let mut policy = Policy::allow_tools(
-        subagent
-            .tools
-            .iter()
-            .filter(|tool| tool.as_ref() != "memory")
-            .cloned(),
-    );
-    if subagent_memory_tool_enabled(subagent) {
-        for operation in subagent_memory_operations(subagent)? {
-            let (decision, reason) = match operation.as_ref() {
-                "read" => (PolicyVerb::Allow, None),
-                "write" => (
-                    PolicyVerb::AskUser,
-                    Some(Arc::from("memory write requires user approval")),
-                ),
-                "forget" => (
-                    PolicyVerb::AskUser,
-                    Some(Arc::from("memory forget requires user approval")),
-                ),
-                other => {
-                    return Err(format!(
-                        "unknown subagent memory operation '{other}'; expected read, write, or forget"
-                    ));
-                }
-            };
-            policy.rules.push(PolicyRule {
-                action: PolicyAction::Tool(Arc::from("memory")),
-                decision,
-                reason,
-                arg_equals: BTreeMap::from([(
-                    Arc::from("operation"),
-                    Value::from(operation.as_ref()),
-                )]),
-            });
-        }
-    }
-    Ok(policy)
-}
-
-fn subagent_memory_tool_enabled(subagent: &SubAgentConfig) -> bool {
-    subagent.tools.iter().any(|tool| tool.as_ref() == "memory") || !subagent.memory_tools.is_empty()
-}
-
-fn subagent_memory_operations(subagent: &SubAgentConfig) -> Result<Vec<Arc<str>>, String> {
-    if subagent.memory_tools.is_empty() {
-        return Ok(vec![Arc::from("read"), Arc::from("write")]);
-    }
-    subagent
-        .memory_tools
+    let registered = specs
         .iter()
-        .map(|operation| match operation.as_ref() {
-            "read" | "write" | "forget" => Ok(Arc::clone(operation)),
-            other => Err(format!(
-                "unknown subagent memory operation '{other}'; expected read, write, or forget"
-            )),
-        })
-        .collect()
-}
-
-pub fn register_builtin_tool(tools: &mut ToolRegistry, name: &str) {
-    match name {
-        "shell" => tools.register(ShellTool),
-        "http" => tools.register(HttpTool),
-        "file" => tools.register(FileTool),
-        "skill_validate" => tools.register(SkillValidateTool),
-        "cron_create" => tools.register(CronCreatorTool),
-        "cron_list" => tools.register(CronListTool),
-        "cron_remove" => tools.register(CronRemoveTool),
-        _ => {}
+        .map(|spec| Arc::clone(&spec.name))
+        .collect::<BTreeSet<_>>();
+    let missing = enabled_mcp
+        .difference(&registered)
+        .map(|name| name.as_ref())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "resources.mcp.enabled references unavailable MCP tool(s): {}",
+            missing.join(", ")
+        ));
     }
+    Ok(specs)
 }
 
 fn subagent_orchestrator(
@@ -827,20 +697,112 @@ fn subagent_orchestrator(
     }
 }
 
-fn allow_tool_once(policy: &mut Policy, tool: Arc<str>) {
-    if tool.as_ref() == "memory" {
-        return;
+fn main_max_turns(config: &WorkspaceConfig) -> usize {
+    config.agent.max_turns
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{McpServerConfig, McpToolConfig, ResourceConfig, ResourceSection};
+    use agentos_interfaces::guardrail::{GuardrailOutcome, ToolGuardrail};
+    use agentos_proto::{AgentId, RunId, ToolCall, ToolCallId};
+    use serde_json::value::RawValue;
+
+    #[test]
+    fn main_max_turns_uses_agent_config() {
+        let mut config = WorkspaceConfig::default();
+        config.agent.max_turns = 23;
+
+        assert_eq!(main_max_turns(&config), 23);
     }
-    if !policy.rules.iter().any(|rule| {
-        rule.action == PolicyAction::Tool(Arc::clone(&tool))
-            && rule.decision == PolicyVerb::Allow
-            && rule.arg_equals.is_empty()
-    }) {
-        policy.rules.push(PolicyRule {
-            action: PolicyAction::Tool(tool),
-            decision: PolicyVerb::Allow,
-            reason: None,
-            arg_equals: BTreeMap::new(),
-        });
+
+    #[tokio::test]
+    async fn mcp_registration_follows_resources_mcp_enabled() {
+        let config = WorkspaceConfig {
+            mcp_servers: vec![McpServerConfig {
+                id: Arc::from("static-mcp"),
+                endpoint: Arc::from("static://local"),
+                timeout_ms: None,
+            }],
+            mcp_tools: vec![
+                McpToolConfig {
+                    server_id: Arc::from("static-mcp"),
+                    name: Arc::from("enabled_mcp"),
+                    description: Arc::from("enabled"),
+                    response: Arc::from("ok"),
+                    requires_isolation: false,
+                },
+                McpToolConfig {
+                    server_id: Arc::from("static-mcp"),
+                    name: Arc::from("disabled_mcp"),
+                    description: Arc::from("disabled"),
+                    response: Arc::from("no"),
+                    requires_isolation: false,
+                },
+            ],
+            resources: ResourceConfig {
+                mcp: ResourceSection {
+                    enabled: vec![Arc::from("enabled_mcp")],
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut tools = ToolRegistry::new();
+
+        let specs = register_configured_mcp(&mut tools, &config)
+            .await
+            .expect("MCP registers");
+
+        assert_eq!(specs.len(), 1);
+        assert!(tools.contains("enabled_mcp"));
+        assert!(!tools.contains("disabled_mcp"));
+    }
+
+    #[tokio::test]
+    async fn default_shell_guardrail_allows_readonly_inspection_commands() {
+        let guardrail = ShellCommandAllowlist::new(DEFAULT_SHELL_ALLOWLIST);
+        for command in DEFAULT_SHELL_ALLOWLIST {
+            let args = RawValue::from_string(format!(r#"{{"command":"{command}"}}"#)).unwrap();
+            let call = ToolCall {
+                id: ToolCallId::new(format!("shell-{command}")),
+                name: Arc::from("shell"),
+                args,
+            };
+
+            let outcome = guardrail
+                .check_call(&call, &test_run_context())
+                .await
+                .expect("guardrail evaluates");
+
+            assert_eq!(outcome, GuardrailOutcome::Passed, "{command} should pass");
+        }
+    }
+
+    #[tokio::test]
+    async fn default_shell_guardrail_still_blocks_unlisted_commands() {
+        let guardrail = ShellCommandAllowlist::new(DEFAULT_SHELL_ALLOWLIST);
+        let args = RawValue::from_string(r#"{"command":"rm"}"#.to_owned()).unwrap();
+        let call = ToolCall {
+            id: ToolCallId::new("shell-rm"),
+            name: Arc::from("shell"),
+            args,
+        };
+
+        let outcome = guardrail
+            .check_call(&call, &test_run_context())
+            .await
+            .expect("guardrail evaluates");
+
+        assert!(matches!(outcome, GuardrailOutcome::Tripped(_)));
+    }
+
+    fn test_run_context<'a>() -> RunContext<'a> {
+        let state = Box::leak(Box::new(agentos_interfaces::RunState::new(
+            RunId::new("runtime-test"),
+            AgentId::new("main-agent"),
+        )));
+        RunContext::from_state(state)
     }
 }

@@ -8,8 +8,11 @@ use agentos_interfaces::guardrail::{
     GuardrailError, GuardrailOutcome, Input, InputGuardrail, OutputGuardrail, ToolGuardrail,
 };
 use agentos_interfaces::orchestrator::{Orchestrator, Plan, RunContext};
-use agentos_interfaces::run_state::{InterruptionAction, RunState};
-use agentos_proto::{AgentId, Message, SpanKind, ToolCall, ToolResult, ToolStatus};
+use agentos_interfaces::run_state::{ApprovalStatus, Interruption, InterruptionAction, RunState};
+use agentos_proto::{
+    AgentId, InterruptionId, Message, MessageRole, SpanId, SpanKind, ToolCall, ToolResult,
+    ToolStatus, Usage, TOKEN_USAGE_METADATA_KEY,
+};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -23,8 +26,8 @@ mod items;
 mod telemetry;
 
 use approval::{approve_transition, ApproveTransition};
-use delegate::execute_delegate;
-use escalate::execute_escalate;
+use delegate::{execute_delegate, execute_resume_delegate, DelegateOutcome};
+use escalate::{execute_escalate, EscalateOutcome};
 use items::{
     assistant_tool_call_item, metadata_value, subagent_result_item, suborchestrator_result_item,
     tool_result_item, tool_status_name,
@@ -128,6 +131,17 @@ pub fn resume_approved(state: RunState) -> Result<RunLoopState, RunError> {
         InterruptionAction::Delegate(spec) => Plan::Delegate(spec),
         InterruptionAction::Escalate(spec) => Plan::Escalate(spec),
         InterruptionAction::Handoff { agent_id, payload } => Plan::Handoff(agent_id, payload),
+        InterruptionAction::ResumeSubAgent {
+            spec,
+            child_channel_id,
+            child_conversation_id,
+            child_state,
+        } => Plan::ResumeSubAgent {
+            spec,
+            child_channel_id,
+            child_conversation_id,
+            child_state,
+        },
     };
     Ok(RunLoopState::Act(ActCtx { state, plan, turns }))
 }
@@ -191,9 +205,135 @@ async fn start(ctx: StartCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunEr
     }))
 }
 
+/// Build the terminal message for a run that hit its turn budget: the most
+/// useful content the run already produced, plus an explicit truncation
+/// notice. Prefers the latest substantive assistant reply, then the latest
+/// tool result, then a generic notice.
+fn budget_exhausted_message(state: &RunState, max_turns: usize) -> Message {
+    let mut assistant_text: Option<Arc<str>> = None;
+    let mut tool_text: Option<Arc<str>> = None;
+    for item in state.transcript.items.iter().rev() {
+        match item.message.role {
+            MessageRole::Assistant
+                if item.message.tool_calls.is_empty()
+                    && !item.message.content.trim().is_empty() =>
+            {
+                assistant_text = Some(item.message.content.clone());
+                break;
+            }
+            MessageRole::Tool if tool_text.is_none() && !item.message.content.trim().is_empty() => {
+                tool_text = Some(item.message.content.clone());
+            }
+            _ => {}
+        }
+    }
+    let note = format!(
+        "\n\n[AgentOS: stopped after the {max_turns}-step budget for this run. The text above \
+         is the best result produced so far — continue with a narrower follow-up, or raise \
+         max_turns, to finish.]"
+    );
+    let body = match (assistant_text, tool_text) {
+        (Some(text), _) => format!("{text}{note}"),
+        (None, Some(text)) => {
+            format!("I hit the step budget before writing a final summary. Latest progress:\n\n{text}{note}")
+        }
+        (None, None) => {
+            format!("I reached the step budget for this run before producing a result.{note}")
+        }
+    };
+    let mut message = Message::text(MessageRole::Assistant, body);
+    message
+        .metadata
+        .insert(Arc::from("run_truncated"), Value::Bool(true));
+    message.metadata.insert(
+        Arc::from("run_truncated_max_turns"),
+        Value::from(max_turns as u64),
+    );
+    message
+}
+
+/// Finish a run that exhausted its turn budget. Records a `run_truncated`
+/// trace span/event and runs output guardrails best-effort: the run *must*
+/// terminate here, so a tripped guardrail (or guardrail backend error)
+/// downgrades to a neutral completion notice instead of re-raising — which
+/// would resurrect the hard-failure path this safeguard exists to remove.
+async fn budget_exhausted_finish(
+    mut state: RunState,
+    turns: usize,
+    deps: &LoopDeps<'_>,
+) -> FinalOutput {
+    let parent_id = trace::run_span_id(&state);
+    let mut fields = BTreeMap::new();
+    fields.insert(Arc::from("turns"), Value::from(turns as u64));
+    fields.insert(Arc::from("max_turns"), Value::from(deps.max_turns as u64));
+    let span_id = trace::record_span(
+        &mut state,
+        parent_id,
+        SpanKind::State,
+        "run_truncated",
+        fields,
+    );
+    trace::record_event(
+        &mut state,
+        deps.hooks,
+        span_id,
+        "run_truncated",
+        BTreeMap::new(),
+    );
+    info!(
+        run_id = state.run_id.as_str(),
+        active_agent = state.active_agent.as_str(),
+        turns,
+        max_turns = deps.max_turns,
+        "run_truncated_budget_exhausted"
+    );
+
+    let message = budget_exhausted_message(&state, deps.max_turns);
+    let guardrail_tripped = {
+        let run_ctx = RunContext::from_state(&state);
+        let mut tripped = false;
+        for entry in deps.output_guardrails {
+            match entry.guardrail.check(&message, &run_ctx).await {
+                Ok(GuardrailOutcome::Passed) => {}
+                Ok(GuardrailOutcome::Tripped(_)) | Err(_) => {
+                    tripped = true;
+                    break;
+                }
+            }
+        }
+        tripped
+    };
+    let message = if guardrail_tripped {
+        Message::text(
+            MessageRole::Assistant,
+            format!(
+                "I reached the {}-step budget for this run and can't return the partial \
+                 output here. Please retry with a narrower request.",
+                deps.max_turns
+            ),
+        )
+    } else {
+        message
+    };
+    FinalOutput { state, message }
+}
+
 async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError> {
     if ctx.turns >= deps.max_turns {
-        return Err(RunError::MaxTurnsExceeded);
+        // Mechanism-level safeguard. Exhausting the turn budget used to abort
+        // the whole run with `MaxTurnsExceeded` — and because sub-agents run
+        // this same loop, a sub-agent hitting its (small) budget failed the
+        // entire parent chain with the opaque "run loop failed: maximum turn
+        // count exceeded" error and discarded every intermediate result.
+        //
+        // Instead, treat the budget as a *stop condition*, not an error:
+        // synthesize a terminal answer from the work already produced and
+        // finish normally. The run still cannot exceed `max_turns` tool
+        // cycles, but the caller (or parent run) gets the best partial
+        // result plus a clear truncation notice rather than a hard failure.
+        return Ok(RunLoopState::Finish(
+            budget_exhausted_finish(ctx.state, ctx.turns, deps).await,
+        ));
     }
 
     let mut state = ctx.state;
@@ -267,6 +407,7 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
         "orchestrator_task_assigned",
         assignment_fields,
     );
+    record_llm_usage(&mut state, deps, plan_span_id.clone(), &plan);
     trace::record_event(
         &mut state,
         deps.hooks,
@@ -298,6 +439,102 @@ async fn plan(ctx: PlanCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunErro
     }
 }
 
+/// Fold the just-completed LLM call's token usage into the run total and emit
+/// a trace event carrying both the per-call breakdown and the running totals,
+/// so the input/output split and cache hit/miss counts are persisted in
+/// `RunState` rather than living only in provider log lines.
+///
+/// Usage rides on the assistant reply's metadata (set by the provider under
+/// `TOKEN_USAGE_METADATA_KEY`). Only `Plan::Reply` carries that message back to
+/// the loop; tool-calling orchestrators that emit `Plan::CallTool` do not
+/// surface the underlying LLM message, so those calls are still captured by the
+/// `agentos_llm::usage` log event but not folded into `RunState.usage`.
+fn record_llm_usage(state: &mut RunState, deps: &LoopDeps<'_>, span_id: SpanId, plan: &Plan) {
+    let Plan::Reply(message) = plan else {
+        return;
+    };
+    let Some(raw) = message.metadata.get(TOKEN_USAGE_METADATA_KEY) else {
+        return;
+    };
+    let call = match serde_json::from_value::<Usage>(raw.clone()) {
+        Ok(call) => call,
+        Err(err) => {
+            info!(
+                run_id = state.run_id.as_str(),
+                error = %err,
+                "discarding malformed token usage metadata on assistant reply"
+            );
+            return;
+        }
+    };
+    state.usage.record_call(&call);
+
+    let total = state.usage;
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        Arc::from("call_input_tokens"),
+        Value::from(call.input_tokens),
+    );
+    fields.insert(
+        Arc::from("call_output_tokens"),
+        Value::from(call.output_tokens),
+    );
+    fields.insert(
+        Arc::from("call_total_tokens"),
+        Value::from(call.total_tokens),
+    );
+    fields.insert(
+        Arc::from("call_cache_read_tokens"),
+        Value::from(call.cache_read_tokens),
+    );
+    fields.insert(
+        Arc::from("call_cache_write_tokens"),
+        Value::from(call.cache_write_tokens),
+    );
+    fields.insert(
+        Arc::from("call_cache_miss_tokens"),
+        Value::from(call.cache_miss_tokens),
+    );
+    fields.insert(
+        Arc::from("run_input_tokens"),
+        Value::from(total.input_tokens),
+    );
+    fields.insert(
+        Arc::from("run_output_tokens"),
+        Value::from(total.output_tokens),
+    );
+    fields.insert(
+        Arc::from("run_total_tokens"),
+        Value::from(total.total_tokens),
+    );
+    fields.insert(
+        Arc::from("run_cache_read_tokens"),
+        Value::from(total.cache_read_tokens),
+    );
+    fields.insert(
+        Arc::from("run_cache_write_tokens"),
+        Value::from(total.cache_write_tokens),
+    );
+    fields.insert(
+        Arc::from("run_cache_miss_tokens"),
+        Value::from(total.cache_miss_tokens),
+    );
+    fields.insert(Arc::from("run_llm_calls"), Value::from(total.tool_calls));
+    trace::record_event(state, deps.hooks, span_id, "llm_token_usage", fields);
+
+    info!(
+        run_id = state.run_id.as_str(),
+        active_agent = state.active_agent.as_str(),
+        call_input_tokens = call.input_tokens,
+        call_output_tokens = call.output_tokens,
+        call_cache_read_tokens = call.cache_read_tokens,
+        call_cache_miss_tokens = call.cache_miss_tokens,
+        run_input_tokens = total.input_tokens,
+        run_output_tokens = total.output_tokens,
+        "llm_token_usage"
+    );
+}
+
 async fn approve(ctx: ApproveCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError> {
     match approve_transition(ctx, deps.policy) {
         ApproveTransition::Allow { state, plan, turns } => {
@@ -321,19 +558,52 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError>
             let result = execute_tool(&mut state, deps, call).await?;
             state.transcript.items.push(tool_result_item(result));
         }
-        Plan::Delegate(spec) => {
-            let result = execute_delegate(&mut state, deps, &spec).await?;
-            state.transcript.items.push(subagent_result_item(result));
-        }
-        Plan::Escalate(spec) => {
-            let result = execute_escalate(&mut state, deps, &spec).await?;
-            state
-                .transcript
-                .items
-                .push(suborchestrator_result_item(&spec, result));
-        }
+        Plan::Delegate(spec) => match execute_delegate(&mut state, deps, &spec).await? {
+            DelegateOutcome::Finished(result) => {
+                state.transcript.items.push(subagent_result_item(result));
+            }
+            DelegateOutcome::Paused(paused) => {
+                return pause_for_subagent_approval(state, spec, paused);
+            }
+        },
+        Plan::Escalate(spec) => match execute_escalate(&mut state, deps, &spec).await? {
+            EscalateOutcome::Finished(result) => {
+                state
+                    .transcript
+                    .items
+                    .push(suborchestrator_result_item(&spec, result));
+            }
+            EscalateOutcome::Paused {
+                stage_agent,
+                paused,
+            } => {
+                return pause_for_subagent_approval(state, stage_agent, *paused);
+            }
+        },
         Plan::Handoff(agent_id, payload) => {
             execute_handoff(&mut state, deps, agent_id, payload);
+        }
+        Plan::ResumeSubAgent {
+            spec,
+            child_channel_id,
+            child_conversation_id,
+            child_state,
+        } => {
+            let paused = crate::subagents::SubAgentPausedRun {
+                agent_id: spec.agent_id.clone(),
+                policy_id: Arc::clone(&spec.policy_id),
+                channel_id: child_channel_id,
+                conversation_id: child_conversation_id,
+                state: *child_state,
+            };
+            match execute_resume_delegate(&mut state, deps, &spec, paused).await? {
+                DelegateOutcome::Finished(result) => {
+                    state.transcript.items.push(subagent_result_item(result));
+                }
+                DelegateOutcome::Paused(paused) => {
+                    return pause_for_subagent_approval(state, spec, paused);
+                }
+            }
         }
         Plan::Reply(_) => {}
     }
@@ -342,6 +612,34 @@ async fn act(ctx: ActCtx, deps: &LoopDeps<'_>) -> Result<RunLoopState, RunError>
         state,
         turns: ctx.turns + 1,
     }))
+}
+
+fn pause_for_subagent_approval(
+    mut state: RunState,
+    spec: agentos_interfaces::orchestrator::SubAgentSpec,
+    paused: crate::subagents::SubAgentPausedRun,
+) -> Result<RunLoopState, RunError> {
+    let child_approval = paused
+        .state
+        .pending_approvals
+        .first()
+        .ok_or(RunError::SubAgent(SubAgentError::Paused))?;
+    let approval_id = InterruptionId::new(format!(
+        "approval-subagent-{}-{}",
+        spec.agent_id.as_str(),
+        child_approval.id.as_str()
+    ));
+    state.pending_approvals.push(Interruption {
+        id: approval_id,
+        action: InterruptionAction::ResumeSubAgent {
+            spec,
+            child_channel_id: paused.channel_id,
+            child_conversation_id: paused.conversation_id,
+            child_state: Box::new(paused.state),
+        },
+        status: ApprovalStatus::Pending,
+    });
+    Ok(RunLoopState::Paused(state))
 }
 
 fn execute_handoff(
@@ -414,23 +712,30 @@ async fn execute_tool(
         BTreeMap::new(),
     );
 
-    {
+    let preflight_guardrail_result = {
         let run_ctx = RunContext::from_state(state);
+        let mut failure = None;
         for entry in deps.tool_guardrails {
             let outcome = entry.guardrail.check_call(&call, &run_ctx).await?;
-            ensure_guardrail_passed(&entry.name, outcome)?;
+            if let GuardrailOutcome::Tripped(reason) = outcome {
+                failure = Some(guardrail_tool_result(&call, &entry.name, reason));
+                break;
+            }
         }
-    }
+        failure
+    };
 
-    let tools = deps
-        .tools
-        .ok_or_else(|| ToolRegistryError::UnknownTool(Arc::clone(&call.name)))?;
-    // Tool failures (bad path, missing file, malformed args) become a Failed
-    // `ToolResult` rather than aborting the run, so the model can read the
-    // error in the next turn and self-correct (e.g. create the missing dir
-    // and retry). Unknown-tool / isolation errors still bubble up — those
-    // indicate a misconfigured runtime, not a recoverable model mistake.
-    let result = {
+    let result = if let Some(result) = preflight_guardrail_result {
+        result
+    } else {
+        let tools = deps
+            .tools
+            .ok_or_else(|| ToolRegistryError::UnknownTool(Arc::clone(&call.name)))?;
+        // Tool failures (bad path, missing file, malformed args) become a Failed
+        // `ToolResult` rather than aborting the run, so the model can read the
+        // error in the next turn and self-correct (e.g. create the missing dir
+        // and retry). Unknown-tool / isolation errors still bubble up — those
+        // indicate a misconfigured runtime, not a recoverable model mistake.
         let run_ctx = RunContext::from_state(state);
         match tools.call_with_context(&call, &run_ctx).await {
             Ok(result) => result,
@@ -459,6 +764,18 @@ async fn execute_tool(
     );
     trace::record_event(state, deps.hooks, tool_span_id, "tool_finished", fields);
     Ok(result)
+}
+
+fn guardrail_tool_result(call: &ToolCall, guardrail: &Arc<str>, reason: Arc<str>) -> ToolResult {
+    let mut metadata = BTreeMap::new();
+    metadata.insert(Arc::from("guardrail"), metadata_value(guardrail.as_ref()));
+    metadata.insert(Arc::from("guardrail_tripped"), Value::Bool(true));
+    ToolResult {
+        call_id: call.id.clone(),
+        status: ToolStatus::Failed,
+        content: Arc::from(format!("guardrail '{guardrail}' tripped: {reason}")),
+        metadata,
+    }
 }
 
 fn ensure_guardrail_passed(name: &Arc<str>, outcome: GuardrailOutcome) -> Result<(), RunError> {

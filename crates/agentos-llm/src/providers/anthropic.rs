@@ -2,7 +2,7 @@ use crate::providers::content::{
     append_descriptors, document_mime, format_text_document, image_mime, read_base64,
     read_text_document,
 };
-use crate::providers::post_json;
+use crate::providers::{attach_token_usage, log_token_usage, post_json};
 use agentos_interfaces::tool::ToolSpec;
 use agentos_proto::{Attachment, AttachmentKind, Message, MessageRole, ToolCall, ToolCallId};
 use serde_json::{json, value::RawValue, Value};
@@ -45,6 +45,7 @@ pub async fn complete(
         &payload,
     )
     .await?;
+    let token_usage = log_token_usage("anthropic", model, &response.body);
     let content_blocks = response
         .body
         .get("content")
@@ -87,14 +88,18 @@ pub async fn complete(
             _ => {}
         }
     }
-    Ok(Message {
+    let mut message = Message {
         role: MessageRole::Assistant,
         content: Arc::from(text),
         attachments: Vec::new(),
         tool_calls,
         tool_call_id: None,
         metadata: Default::default(),
-    })
+    };
+    if let Some(usage) = token_usage {
+        attach_token_usage(&mut message, usage);
+    }
+    Ok(message)
 }
 
 fn anthropic_tool_spec(spec: &ToolSpec) -> Value {
@@ -294,7 +299,7 @@ mod tests {
         assert_eq!(blocks[0]["text"], "look");
         assert_eq!(blocks[1]["type"], "image");
         assert_eq!(blocks[1]["source"]["media_type"], "image/jpeg");
-        assert!(blocks[1]["source"]["data"].as_str().unwrap().len() > 0);
+        assert!(!blocks[1]["source"]["data"].as_str().unwrap().is_empty());
     }
 
     #[test]

@@ -1,10 +1,10 @@
 name = "software-dev"
 description = "Coordinates software development work through implementation stages."
 developer_instructions = """
-Translate software development requests into ordered delegated stages.
-Keep each stage scoped to the least privileged subagent that can complete it.
+Translate software development and bug-fix requests into ordered delegated stages.
+Use the codereview subagent for submitted issue descriptions, failing behavior, regressions, and focused codebase bug fixes.
 Return one synthesized result to the parent run after all stages complete.
 """
 stages = [
-  { name = "implement", agent_id = "general-subagent", policy_id = "general" },
+  { name = "fix", agent_id = "codereview-subagent", policy_id = "code-fix" },
 ]

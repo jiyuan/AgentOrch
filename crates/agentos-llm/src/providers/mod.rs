@@ -4,13 +4,15 @@ pub mod deepseek;
 pub mod ollama;
 pub mod openai;
 
+use agentos_proto::{Message, TOKEN_USAGE_METADATA_KEY};
 use rand::Rng;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use reqwest::{Client, StatusCode};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::env;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -21,17 +23,191 @@ pub(crate) struct JsonHttpResponse {
     pub body: Value,
 }
 
+/// Tokens consumed by a single LLM call, normalised across providers.
+///
+/// `input_tokens` is the full prompt-side token count (including any portion
+/// served from cache), so it stays comparable across providers. The cache
+/// breakdown always satisfies `cache_read + cache_write + cache_miss ==
+/// input_tokens`:
+/// - `cache_read_tokens`  — prompt tokens served from a prompt cache (hits;
+///   billed at a discount by OpenAI/DeepSeek/Anthropic).
+/// - `cache_write_tokens` — prompt tokens written into the cache this call
+///   (Anthropic `cache_creation_input_tokens`; 0 for providers that cache
+///   transparently).
+/// - `cache_miss_tokens`  — prompt tokens processed without any cache benefit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub cache_miss_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Extract and normalise token counts from a provider response body.
+    /// Handles the three shapes AgentOS talks to:
+    /// - OpenAI: `usage.{prompt_tokens, completion_tokens, total_tokens}` with
+    ///   `usage.prompt_tokens_details.cached_tokens` for cache hits.
+    /// - DeepSeek: as OpenAI, plus explicit
+    ///   `usage.{prompt_cache_hit_tokens, prompt_cache_miss_tokens}`.
+    /// - Anthropic: `usage.{input_tokens, output_tokens,
+    ///   cache_read_input_tokens, cache_creation_input_tokens}` where
+    ///   `input_tokens` excludes cached/created tokens.
+    /// - Ollama: top-level `prompt_eval_count` / `eval_count` (no caching).
+    ///
+    /// Returns `None` when the response carries no usage information at all.
+    pub fn from_response_body(body: &Value) -> Option<Self> {
+        let u = |v: &Value, key: &str| v.get(key).and_then(Value::as_u64);
+
+        if let Some(usage) = body.get("usage") {
+            // Anthropic: no `prompt_tokens`; `input_tokens` is the uncached
+            // remainder, with cache read/creation reported separately.
+            if usage.get("prompt_tokens").is_none()
+                && (usage.get("input_tokens").is_some() || usage.get("output_tokens").is_some())
+            {
+                let miss = u(usage, "input_tokens").unwrap_or(0);
+                let cache_read = u(usage, "cache_read_input_tokens").unwrap_or(0);
+                let cache_write = u(usage, "cache_creation_input_tokens").unwrap_or(0);
+                let output = u(usage, "output_tokens").unwrap_or(0);
+                let input = miss + cache_read + cache_write;
+                return Some(Self {
+                    input_tokens: input,
+                    output_tokens: output,
+                    total_tokens: input + output,
+                    cache_read_tokens: cache_read,
+                    cache_write_tokens: cache_write,
+                    cache_miss_tokens: miss,
+                });
+            }
+
+            // OpenAI / DeepSeek shared shape.
+            let prompt = u(usage, "prompt_tokens");
+            let completion = u(usage, "completion_tokens");
+            let total = u(usage, "total_tokens");
+            if prompt.is_none() && completion.is_none() && total.is_none() {
+                return None;
+            }
+            let input = prompt.unwrap_or(0);
+            let output = completion.unwrap_or(0);
+            // DeepSeek reports explicit hit/miss; OpenAI nests cached_tokens.
+            let cache_read = u(usage, "prompt_cache_hit_tokens").or_else(|| {
+                usage
+                    .get("prompt_tokens_details")
+                    .and_then(|d| d.get("cached_tokens"))
+                    .and_then(Value::as_u64)
+            });
+            let cache_miss = u(usage, "prompt_cache_miss_tokens");
+            let cache_read =
+                cache_read.unwrap_or_else(|| input.saturating_sub(cache_miss.unwrap_or(input)));
+            let cache_miss = cache_miss.unwrap_or_else(|| input.saturating_sub(cache_read));
+            return Some(Self {
+                input_tokens: input,
+                output_tokens: output,
+                total_tokens: total.unwrap_or(input + output),
+                cache_read_tokens: cache_read,
+                cache_write_tokens: 0,
+                cache_miss_tokens: cache_miss,
+            });
+        }
+
+        // Ollama reports counts at the top level and has no prompt cache.
+        let prompt = body.get("prompt_eval_count").and_then(Value::as_u64);
+        let completion = body.get("eval_count").and_then(Value::as_u64);
+        if prompt.is_none() && completion.is_none() {
+            return None;
+        }
+        let input = prompt.unwrap_or(0);
+        let output = completion.unwrap_or(0);
+        Some(Self {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: input + output,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cache_miss_tokens: input,
+        })
+    }
+}
+
+/// Emit a structured tracing event recording the tokens consumed by one LLM
+/// call. Logged under the dedicated `agentos_llm::usage` target so operators
+/// can filter or aggregate token spend per provider+model without parsing
+/// free-form log lines (e.g. `RUST_LOG=agentos_llm::usage=info`).
+pub(crate) fn log_token_usage(provider: &str, model: &str, body: &Value) -> Option<TokenUsage> {
+    let usage = TokenUsage::from_response_body(body);
+    match usage {
+        Some(usage) => tracing::info!(
+            target: "agentos_llm::usage",
+            provider,
+            model,
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
+            total_tokens = usage.total_tokens,
+            cache_read_tokens = usage.cache_read_tokens,
+            cache_write_tokens = usage.cache_write_tokens,
+            cache_miss_tokens = usage.cache_miss_tokens,
+            "llm token usage"
+        ),
+        None => tracing::debug!(
+            target: "agentos_llm::usage",
+            provider,
+            model,
+            "llm call returned no token usage metadata"
+        ),
+    }
+    usage
+}
+
+/// Record the call's token usage on the assistant message so the run loop can
+/// fold it into `RunState.usage`. Keyed by [`TOKEN_USAGE_METADATA_KEY`]; the
+/// JSON shape matches `agentos_proto::Usage`'s token fields. A serialization
+/// failure here must never fail the LLM call, so it degrades to a trace-only
+/// record (the `agentos_llm::usage` event above already fired).
+pub(crate) fn attach_token_usage(message: &mut Message, usage: TokenUsage) {
+    match serde_json::to_value(usage) {
+        Ok(value) => {
+            message
+                .metadata
+                .insert(Arc::from(TOKEN_USAGE_METADATA_KEY), value);
+        }
+        Err(err) => tracing::debug!(
+            target: "agentos_llm::usage",
+            error = %err,
+            "failed to serialize token usage into message metadata"
+        ),
+    }
+}
+
 const MAX_ATTEMPTS: u32 = 5;
 const BASE_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(8);
 const RETRY_AFTER_CAP: Duration = Duration::from_secs(30);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Total request budget — reqwest's `.timeout()` also covers reading the
+/// response body, and `post_json` buffers the whole completion via
+/// `response.bytes()`. Large prompts (e.g. the audit skill, which feeds a
+/// multi-KB SKILL.md plus several 64 KB file tails) drive generations well
+/// past a minute, so a 60 s cap aborted mid-body and surfaced as
+/// `error decoding response body; http_status=200`. Default to 300 s and let
+/// operators tune it for slower models via the env var.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const REQUEST_TIMEOUT_ENV: &str = "AGENTOS_LLM_REQUEST_TIMEOUT_SECS";
 
 fn shared_client() -> &'static Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
+        let request_timeout = env::var(REQUEST_TIMEOUT_ENV)
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .map_or(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs);
         Client::builder()
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(request_timeout)
+            // Fail fast on a dead endpoint instead of burning the full body
+            // budget; only the connection phase is bounded here.
+            .connect_timeout(Duration::from_secs(10))
             .pool_idle_timeout(Duration::from_secs(90))
             .user_agent(concat!("agentos-llm/", env!("CARGO_PKG_VERSION")))
             .build()
@@ -238,6 +414,156 @@ fn openai_quota_hint(error: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentos_proto::{MessageRole, Usage};
+
+    use serde_json::json;
+
+    #[test]
+    fn attached_usage_deserializes_into_proto_usage_with_cache_breakdown() {
+        let usage = TokenUsage {
+            input_tokens: 2100,
+            output_tokens: 45,
+            total_tokens: 2145,
+            cache_read_tokens: 800,
+            cache_write_tokens: 1200,
+            cache_miss_tokens: 100,
+        };
+        let mut message = Message::text(MessageRole::Assistant, "hi");
+        attach_token_usage(&mut message, usage);
+
+        let raw = message
+            .metadata
+            .get(TOKEN_USAGE_METADATA_KEY)
+            .expect("usage attached under the shared metadata key");
+        let decoded: Usage =
+            serde_json::from_value(raw.clone()).expect("TokenUsage shape matches proto Usage");
+        assert_eq!(
+            decoded,
+            Usage {
+                input_tokens: 2100,
+                output_tokens: 45,
+                total_tokens: 2145,
+                cache_read_tokens: 800,
+                cache_write_tokens: 1200,
+                cache_miss_tokens: 100,
+                // tool_calls is the run-level accumulator; absent on per-call
+                // metadata, so it defaults to 0 here.
+                tool_calls: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn token_usage_parses_openai_with_cached_prompt_details() {
+        let body = json!({
+            "usage": {
+                "prompt_tokens": 2000,
+                "completion_tokens": 300,
+                "total_tokens": 2300,
+                "prompt_tokens_details": { "cached_tokens": 1920 }
+            }
+        });
+        assert_eq!(
+            TokenUsage::from_response_body(&body),
+            Some(TokenUsage {
+                input_tokens: 2000,
+                output_tokens: 300,
+                total_tokens: 2300,
+                cache_read_tokens: 1920,
+                cache_write_tokens: 0,
+                cache_miss_tokens: 80,
+            })
+        );
+    }
+
+    #[test]
+    fn token_usage_parses_deepseek_explicit_hit_miss() {
+        let body = json!({
+            "usage": {
+                "prompt_tokens": 2006,
+                "completion_tokens": 30,
+                "total_tokens": 2036,
+                "prompt_cache_hit_tokens": 1920,
+                "prompt_cache_miss_tokens": 86
+            }
+        });
+        assert_eq!(
+            TokenUsage::from_response_body(&body),
+            Some(TokenUsage {
+                input_tokens: 2006,
+                output_tokens: 30,
+                total_tokens: 2036,
+                cache_read_tokens: 1920,
+                cache_write_tokens: 0,
+                cache_miss_tokens: 86,
+            })
+        );
+    }
+
+    #[test]
+    fn token_usage_no_cache_fields_treats_all_input_as_miss() {
+        let body = json!({
+            "usage": { "prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150 }
+        });
+        assert_eq!(
+            TokenUsage::from_response_body(&body),
+            Some(TokenUsage {
+                input_tokens: 120,
+                output_tokens: 30,
+                total_tokens: 150,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cache_miss_tokens: 120,
+            })
+        );
+    }
+
+    #[test]
+    fn token_usage_parses_anthropic_cache_read_and_creation() {
+        let body = json!({
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 45,
+                "cache_read_input_tokens": 800,
+                "cache_creation_input_tokens": 1200
+            }
+        });
+        assert_eq!(
+            TokenUsage::from_response_body(&body),
+            Some(TokenUsage {
+                input_tokens: 2100,
+                output_tokens: 45,
+                total_tokens: 2145,
+                cache_read_tokens: 800,
+                cache_write_tokens: 1200,
+                cache_miss_tokens: 100,
+            })
+        );
+    }
+
+    #[test]
+    fn token_usage_parses_ollama_top_level_counts() {
+        let body = json!({ "prompt_eval_count": 18, "eval_count": 7 });
+        assert_eq!(
+            TokenUsage::from_response_body(&body),
+            Some(TokenUsage {
+                input_tokens: 18,
+                output_tokens: 7,
+                total_tokens: 25,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cache_miss_tokens: 18,
+            })
+        );
+    }
+
+    #[test]
+    fn token_usage_absent_when_no_usage_metadata() {
+        assert_eq!(
+            TokenUsage::from_response_body(&json!({ "choices": [] })),
+            None
+        );
+    }
 
     #[test]
     fn retry_after_parses_seconds() {

@@ -1,0 +1,22 @@
+name = "skill-editor-subagent"
+id = "skill-editor-subagent"
+description = "Authors and rebuilds skill bundles. Reads and writes the relevant workspace/skills/<name>/SKILL.md (and its scripts), then runs skill_validate until the bundle is valid."
+developer_instructions = """
+Own skill-bundle edits only.
+Read the target workspace/skills/<name>/SKILL.md and write focused changes directly with the file tool; preserve unrelated content.
+Use the skill-creator skill for structural rebuilds.
+Run skill_validate("<name>") after editing. Stop as soon as it passes and the bundle matches the request — do not keep re-validating.
+Do not use shell for skill validation.
+Report the changed files and the validation result.
+"""
+policy_id = "skill-edit"
+orchestrator = "builtin.max"
+model_tier = "medium"
+tools = ["file", "skill_validate", "memory"]
+skills = ["skill-creator"]
+memory_view = "shared_readonly"
+memory_domains = ["agentos"]
+memory_tools = ["read"]
+max_turns = 8
+inherit_guardrails = true
+skill_bundle_writer = true

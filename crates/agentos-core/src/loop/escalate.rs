@@ -1,10 +1,10 @@
-use super::delegate::execute_delegate;
+use super::delegate::{execute_delegate, DelegateOutcome};
 use super::telemetry::{
     record_suborch_failure, record_telemetry_event, suborch_stage_agent_telemetry_fields,
     suborch_stage_telemetry_fields, suborch_telemetry_fields,
 };
 use super::{LoopDeps, RunError};
-use crate::subagents::{SubAgentError, SubAgentRunOutput};
+use crate::subagents::{SubAgentError, SubAgentPausedRun, SubAgentRunOutput};
 use crate::trace;
 use agentos_interfaces::orchestrator::SubOrchSpec;
 use agentos_interfaces::run_state::RunState;
@@ -13,11 +13,19 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+pub(super) enum EscalateOutcome {
+    Finished(Vec<(Arc<str>, SubAgentRunOutput)>),
+    Paused {
+        stage_agent: agentos_interfaces::orchestrator::SubAgentSpec,
+        paused: Box<SubAgentPausedRun>,
+    },
+}
+
 pub(super) async fn execute_escalate(
     state: &mut RunState,
     deps: &LoopDeps<'_>,
     spec: &SubOrchSpec,
-) -> Result<Vec<(Arc<str>, SubAgentRunOutput)>, RunError> {
+) -> Result<EscalateOutcome, RunError> {
     let parent_id = trace::run_span_id(state);
     let mut fields = BTreeMap::new();
     fields.insert(
@@ -144,7 +152,23 @@ pub(super) async fn execute_escalate(
             suborch_stage_agent_telemetry_fields(spec, &stage_name, &stage_agent),
         );
         let result = match execute_delegate(state, deps, &stage_agent).await {
-            Ok(result) => result,
+            Ok(DelegateOutcome::Finished(result)) => result,
+            Ok(DelegateOutcome::Paused(paused)) => {
+                let mut fields =
+                    suborch_stage_agent_telemetry_fields(spec, &stage_name, &stage_agent);
+                fields.insert(Arc::from("status"), Value::String("paused".to_owned()));
+                record_telemetry_event(
+                    state,
+                    deps.hooks,
+                    span_id.clone(),
+                    "suborch_stage_call_paused",
+                    fields,
+                );
+                return Ok(EscalateOutcome::Paused {
+                    stage_agent,
+                    paused: Box::new(paused),
+                });
+            }
             Err(error) => {
                 let mut fields =
                     suborch_stage_agent_telemetry_fields(spec, &stage_name, &stage_agent);
@@ -211,5 +235,5 @@ pub(super) async fn execute_escalate(
         "suborch_teardown",
         teardown_fields,
     );
-    Ok(ordered)
+    Ok(EscalateOutcome::Finished(ordered))
 }

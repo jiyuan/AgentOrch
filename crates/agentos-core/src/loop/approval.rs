@@ -53,7 +53,9 @@ fn pause_for_approval(ctx: ApproveCtx, reason: Arc<str>) -> ApproveTransition {
             handoff_approval_id(&agent_id),
             InterruptionAction::Handoff { agent_id, payload },
         ),
-        Plan::Reply(_) => return ApproveTransition::Unsupported { reason },
+        Plan::Reply(_) | Plan::ResumeSubAgent { .. } => {
+            return ApproveTransition::Unsupported { reason }
+        }
     };
 
     let mut state = ctx.state;

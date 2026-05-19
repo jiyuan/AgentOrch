@@ -26,6 +26,12 @@ pub struct SubAgentConfig {
     pub memory_tools: Vec<Arc<str>>,
     pub max_turns: usize,
     pub inherit_guardrails: bool,
+    /// Opt-in: permits this sub-agent to write inside the skill-bundle
+    /// directory. Defaults to `false`, so every sub-agent is blocked from
+    /// tampering with `SKILL.md` bundles by the skill-bundle write guardrail
+    /// unless it is the designated skill editor. This is a permission grant,
+    /// not a convenience toggle — set it only on the dedicated skill editor.
+    pub skill_bundle_writer: bool,
     /// Character cap for `MaxOutputLength` when `inherit_guardrails = true`.
     /// Tripped output aborts the run, so this needs to comfortably exceed any
     /// reply you expect from the model. Defaults are tuned for chat: long
@@ -51,6 +57,7 @@ impl Default for SubAgentConfig {
             memory_tools: Vec::new(),
             max_turns: 4,
             inherit_guardrails: true,
+            skill_bundle_writer: false,
             max_output_chars: 64_000,
         }
     }
@@ -76,11 +83,11 @@ pub(super) fn normalize_memory_tool(input: &str) -> Result<String, String> {
     }
 }
 
-pub(super) fn subagent_memory_metadata(
+pub(super) fn subagent_metadata(
     subagent: &SubAgentConfig,
 ) -> Result<BTreeMap<Arc<str>, Value>, String> {
     let memory_view = normalize_memory_view(&subagent.memory_view)?;
-    let mut metadata = BTreeMap::new();
+    let mut metadata = descriptive_subagent_metadata(subagent);
     if memory_view == "none" {
         if !subagent.memory_domains.is_empty() {
             return Err(format!(
@@ -125,4 +132,41 @@ pub(super) fn subagent_memory_metadata(
         );
     }
     Ok(metadata)
+}
+
+fn descriptive_subagent_metadata(subagent: &SubAgentConfig) -> BTreeMap<Arc<str>, Value> {
+    let mut metadata = BTreeMap::new();
+    metadata.insert(
+        Arc::from("subagent_name"),
+        Value::String(subagent.name.to_string()),
+    );
+    metadata.insert(
+        Arc::from("subagent_description"),
+        Value::String(subagent.description.to_string()),
+    );
+    metadata.insert(
+        Arc::from("subagent_tools"),
+        Value::Array(
+            subagent
+                .tools
+                .iter()
+                .map(|tool| Value::String(tool.to_string()))
+                .collect(),
+        ),
+    );
+    metadata.insert(
+        Arc::from("subagent_skills"),
+        Value::Array(
+            subagent
+                .skills
+                .iter()
+                .map(|skill| Value::String(skill.to_string()))
+                .collect(),
+        ),
+    );
+    metadata.insert(
+        Arc::from("subagent_max_turns"),
+        Value::from(subagent.max_turns as u64),
+    );
+    metadata
 }

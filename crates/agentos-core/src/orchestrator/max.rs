@@ -1,12 +1,14 @@
 use super::commands::deterministic_plan_from_user_text;
 use super::routing::{
-    classify_task, latest_user_content, materialize_dispatch, parse_routing_decision,
-    routing_classifier_messages, rule_for_domain, rule_for_domain_key, ROUTER_CONFIDENCE_THRESHOLD,
+    latest_user_content, materialize_dispatch, parse_routing_decision, routing_classifier_messages,
+    rule_for_domain_key, ROUTER_CONFIDENCE_THRESHOLD,
 };
 use crate::memory::{
     memory_caller_from_context, HydrationRequest, MemoryManager, MemoryStore, RetrievalStrategy,
 };
-use crate::skills::{builtin_skill_planners, SkillPlanner, WorkspaceSkillCatalog};
+use crate::skills::{
+    builtin_skill_planners, is_skill_authoring_request, SkillPlanner, WorkspaceSkillCatalog,
+};
 use agentos_interfaces::orchestrator::{
     DispatchPriority, Orchestrator, OrchestratorError, Plan, ResourceEntry, ResourceIndex,
     ResourceKind, RoutingRule, RoutingTable, RunContext,
@@ -142,15 +144,34 @@ impl MaxOrchestrator {
 
     async fn plan_with_llm(&self, ctx: &RunContext<'_>) -> Result<Plan, OrchestratorError> {
         let max_plan = self.plan_without_routing_fallback(ctx).await?;
-        let Some(input) = latest_user_content(ctx) else {
-            return Ok(max_plan);
-        };
-        if !should_route_to_llm(ctx, &max_plan) {
+        let latest_user_input = latest_user_content(ctx);
+        let keep_skill_authoring_local = latest_user_input.as_ref().is_some_and(|input| {
+            self.skill_catalog.contains("skill-creator")
+                && is_skill_authoring_request(input.as_ref())
+        });
+        let keep_workspace_skill_local = latest_user_input
+            .as_ref()
+            .is_some_and(|input| workspace_skill_request_matches(&self.skill_catalog, input));
+        let keep_workspace_diagnostics_local = latest_user_input
+            .as_ref()
+            .is_some_and(|input| workspace_diagnostic_request_matches(input));
+        if !(should_route_to_llm(ctx, &max_plan)
+            || keep_skill_authoring_local
+            || keep_workspace_skill_local
+            || keep_workspace_diagnostics_local)
+        {
             return Ok(max_plan);
         }
 
-        if let Some(plan) = self.route_user_text_with_llm(ctx, &input).await? {
-            return Ok(plan);
+        if !(keep_skill_authoring_local
+            || keep_workspace_skill_local
+            || keep_workspace_diagnostics_local)
+        {
+            if let Some(input) = latest_user_input.as_ref() {
+                if let Some(plan) = self.route_user_text_with_llm(ctx, input).await? {
+                    return Ok(plan);
+                }
+            }
         }
         if let Some(llm) = self.llm.as_ref().filter(|llm| llm.is_available()) {
             // Use the tool-aware path so the model can request `Plan::CallTool`
@@ -162,10 +183,10 @@ impl MaxOrchestrator {
             // so the LLM has the "how to use this skill" guidance — not just
             // the one-line description that lives in the resource index.
             // Without this, a sub-agent with `skills = ["skill-creator"]`
-            // sees `skill_create` in its tools list but never reads the
-            // SKILL.md that says "use `body` and `files` for one-shot bundle
-            // creation", so it falls back to calling the tool with name +
-            // description only and produces empty skeletons.
+            // sees only generic file / validation tools and never reads the
+            // SKILL.md workflow that says to plan the bundle, write support
+            // resources before SKILL.md, validate, then inspect the validator
+            // inventory before the final response.
             let mut messages: Vec<Message> =
                 Vec::with_capacity(ctx.state.transcript.items.len() + 1);
             if let Some(prelude) = self.skill_prelude_message() {
@@ -186,6 +207,12 @@ impl MaxOrchestrator {
                 return Ok(Plan::CallTool(first));
             }
             return Ok(Plan::Reply(response));
+        }
+        if keep_skill_authoring_local
+            || keep_workspace_skill_local
+            || keep_workspace_diagnostics_local
+        {
+            return Ok(max_plan);
         }
         self.plan_internal(ctx, true).await
     }
@@ -255,14 +282,127 @@ fn should_route_to_llm(ctx: &RunContext<'_>, plan: &Plan) -> bool {
     let Some(item) = ctx.state.transcript.items.last() else {
         return false;
     };
-    if item.message.role != MessageRole::User {
+    match item.message.role {
+        MessageRole::User | MessageRole::Tool => matches!(
+            plan,
+            Plan::Reply(message)
+                if message.role == MessageRole::Assistant && message.content == item.message.content
+        ),
+        MessageRole::Assistant | MessageRole::System => false,
+    }
+}
+
+fn workspace_skill_request_matches(catalog: &WorkspaceSkillCatalog, input: &str) -> bool {
+    if workspace_skill_maintenance_request_matches(input) {
         return false;
     }
-    matches!(
-        plan,
-        Plan::Reply(message)
-            if message.role == MessageRole::Assistant && message.content == item.message.content
-    )
+    let normalized_input = normalize_skill_trigger_text(input);
+    catalog.skills().any(|skill| {
+        let skill_name = skill.name.as_ref();
+        if skill_name == "skill-creator" {
+            return false;
+        }
+        skill_trigger_aliases(skill_name).into_iter().any(|alias| {
+            let normalized_alias = normalize_skill_trigger_text(&alias);
+            contains_trigger_phrase(&normalized_input, &normalized_alias)
+        })
+    })
+}
+
+fn workspace_skill_maintenance_request_matches(input: &str) -> bool {
+    let normalized = normalize_skill_trigger_text(input);
+    [
+        "change",
+        "debug",
+        "edit",
+        "fix",
+        "implement",
+        "modify",
+        "reconstruct",
+        "redesign",
+        "refactor",
+        "repair",
+        "rewrite",
+        "update",
+    ]
+    .iter()
+    .any(|phrase| contains_trigger_phrase(&normalized, phrase))
+}
+
+fn skill_trigger_aliases(name: &str) -> Vec<String> {
+    let mut aliases = vec![name.to_owned(), name.replace(['-', '_'], " ")];
+    if let Some(base) = name.strip_suffix("-skill") {
+        if base.len() >= 4 {
+            aliases.push(base.to_owned());
+            aliases.push(format!("{} skill", base.replace(['-', '_'], " ")));
+        }
+    }
+    aliases
+}
+
+fn normalize_skill_trigger_text(input: &str) -> String {
+    input
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn contains_trigger_phrase(input: &str, phrase: &str) -> bool {
+    if phrase.is_empty() {
+        return false;
+    }
+    let input = format!(" {input} ");
+    let phrase = format!(" {phrase} ");
+    input.contains(&phrase)
+}
+
+fn workspace_diagnostic_request_matches(input: &str) -> bool {
+    let normalized = normalize_skill_trigger_text(input);
+    let asks_for_diagnosis = [
+        "investigate",
+        "inspect",
+        "check",
+        "debug",
+        "troubleshoot",
+        "diagnose",
+        "list",
+        "show",
+        "why",
+    ]
+    .iter()
+    .any(|phrase| contains_trigger_phrase(&normalized, phrase));
+    if !asks_for_diagnosis {
+        return false;
+    }
+
+    [
+        "file",
+        "files",
+        "config",
+        "configuration",
+        "session",
+        "sessions",
+        "log",
+        "logs",
+        "logging",
+        "workspace",
+        "repo",
+        "repository",
+        "codebase",
+        "skill",
+        "audit skill",
+    ]
+    .iter()
+    .any(|phrase| contains_trigger_phrase(&normalized, phrase))
 }
 
 #[async_trait]
@@ -385,9 +525,7 @@ impl MaxOrchestrator {
         input: &str,
         allow_fallback: bool,
     ) -> Option<Plan> {
-        let rule = classify_task(input)
-            .and_then(|domain| rule_for_domain(&self.routing_table, &domain))
-            .or_else(|| allow_fallback.then_some(&self.routing_table.fallback))?;
+        let rule = allow_fallback.then_some(&self.routing_table.fallback)?;
         materialize_dispatch(ctx, input, &rule.dispatch)
     }
 }
@@ -411,8 +549,17 @@ fn resource_index_from_tools(tools: &[ToolSpec]) -> ResourceIndex {
 mod tests {
     use super::*;
     use crate::skills::WorkspaceSkillCatalog;
+    use agentos_interfaces::orchestrator::{DispatchTarget, SubAgentSpec, TaskDomain};
+    use agentos_interfaces::session::Item;
+    use agentos_interfaces::RunState;
+    use agentos_llm::LlmError;
     use agentos_proto::MessageRole;
+    use agentos_proto::{AgentId, RunId, ToolCall, ToolCallId};
+    use async_trait::async_trait;
+    use serde_json::{json, value::RawValue};
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn skill_prelude_message_emits_each_skill_instructions() {
@@ -444,5 +591,401 @@ mod tests {
     fn skill_prelude_message_is_none_when_catalog_empty() {
         let orch = MaxOrchestrator::default();
         assert!(orch.skill_prelude_message().is_none());
+    }
+
+    #[test]
+    fn workspace_skill_request_matches_enabled_skill_aliases() {
+        let catalog = WorkspaceSkillCatalog::from_skills([
+            crate::skills::WorkspaceSkill {
+                name: Arc::from("audit-skill"),
+                description: Arc::from("reports usage"),
+                path: PathBuf::from("/tmp/audit-skill"),
+                instructions: Arc::from("# Audit Skill\n\nRead audit memory."),
+            },
+            crate::skills::WorkspaceSkill {
+                name: Arc::from("web-research"),
+                description: Arc::from("does research"),
+                path: PathBuf::from("/tmp/web-research"),
+                instructions: Arc::from("# Web Research\n\nUse http."),
+            },
+        ]);
+
+        assert!(workspace_skill_request_matches(
+            &catalog,
+            "Run an audit for the last 24 hours"
+        ));
+        assert!(workspace_skill_request_matches(
+            &catalog,
+            "call audit_skill now"
+        ));
+        assert!(workspace_skill_request_matches(
+            &catalog,
+            "web research: summarize this URL"
+        ));
+        assert!(!workspace_skill_request_matches(
+            &catalog,
+            "Reconstruct audit-skill via analysis of log files"
+        ));
+        assert!(!workspace_skill_request_matches(
+            &catalog,
+            "compare these implementation options"
+        ));
+    }
+
+    #[test]
+    fn workspace_diagnostic_request_matches_local_artifacts() {
+        assert!(workspace_diagnostic_request_matches(
+            "list the files the audit-skill explored, and investigate the memory configuration, sessions and logging"
+        ));
+        assert!(workspace_diagnostic_request_matches(
+            "check workspace logs and config"
+        ));
+        assert!(!workspace_diagnostic_request_matches(
+            "investigate the latest implementation options"
+        ));
+    }
+
+    #[tokio::test]
+    async fn natural_language_skill_creation_stays_in_parent_llm_path() {
+        let llm = Arc::new(ToolCallingLlm::default());
+        let catalog = WorkspaceSkillCatalog::from_skills([crate::skills::WorkspaceSkill {
+            name: Arc::from("skill-creator"),
+            description: Arc::from("creates skills"),
+            path: PathBuf::from("/tmp/skill-creator"),
+            instructions: Arc::from("# Skill Creator\n\nCreate skills with the file tool."),
+        }]);
+        let orch = MaxOrchestrator::with_tools(vec![ToolSpec {
+            name: Arc::from("file"),
+            description: Arc::from("read and write files"),
+            input_schema: json!({"type": "object"}),
+            requires_isolation: false,
+        }])
+        .with_skill_catalog(catalog)
+        .with_routing_table(RoutingTable {
+            rules: vec![RoutingRule {
+                domain: TaskDomain::SoftwareDev,
+                description: Arc::from("software tasks"),
+                examples: Vec::new(),
+                dispatch: DispatchTarget::Delegate(SubAgentSpec {
+                    agent_id: AgentId::new("general-subagent"),
+                    policy_id: Arc::from("general"),
+                    metadata: BTreeMap::new(),
+                }),
+            }],
+            fallback: RoutingRule {
+                domain: TaskDomain::General,
+                description: Arc::from("fallback"),
+                examples: Vec::new(),
+                dispatch: DispatchTarget::Delegate(SubAgentSpec {
+                    agent_id: AgentId::new("general-subagent"),
+                    policy_id: Arc::from("general"),
+                    metadata: BTreeMap::new(),
+                }),
+            },
+        })
+        .with_llm(llm.clone());
+
+        let mut state = RunState::new(RunId::new("run-skill"), AgentId::new("default"));
+        state.transcript.items.push(Item {
+            message: Message::text(
+                MessageRole::User,
+                "please create a skill called rss-digest for summarizing feeds",
+            ),
+            metadata: BTreeMap::new(),
+        });
+        let ctx = RunContext::from_state(&state);
+
+        let plan = orch.plan(&ctx).await.expect("plan should succeed");
+        assert!(
+            !llm.saw_router_prompt.load(Ordering::SeqCst),
+            "skill creation should bypass routing delegation"
+        );
+        match plan {
+            Plan::CallTool(call) => assert_eq!(call.name.as_ref(), "file"),
+            other => panic!("expected parent file tool call, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_workspace_skill_request_stays_in_parent_llm_path() {
+        let llm = Arc::new(ToolCallingLlm::default());
+        let catalog = WorkspaceSkillCatalog::from_skills([crate::skills::WorkspaceSkill {
+            name: Arc::from("audit-skill"),
+            description: Arc::from("reports usage"),
+            path: PathBuf::from("/tmp/audit-skill"),
+            instructions: Arc::from("# Audit Skill\n\nRead audit memory."),
+        }]);
+        let orch = MaxOrchestrator::with_tools(vec![ToolSpec {
+            name: Arc::from("file"),
+            description: Arc::from("read and write files"),
+            input_schema: json!({"type": "object"}),
+            requires_isolation: false,
+        }])
+        .with_skill_catalog(catalog)
+        .with_routing_table(RoutingTable {
+            rules: vec![RoutingRule {
+                domain: TaskDomain::Research,
+                description: Arc::from("research and investigation"),
+                examples: Vec::new(),
+                dispatch: DispatchTarget::Delegate(SubAgentSpec {
+                    agent_id: AgentId::new("research-subagent"),
+                    policy_id: Arc::from("research"),
+                    metadata: BTreeMap::new(),
+                }),
+            }],
+            fallback: RoutingRule {
+                domain: TaskDomain::General,
+                description: Arc::from("fallback"),
+                examples: Vec::new(),
+                dispatch: DispatchTarget::Delegate(SubAgentSpec {
+                    agent_id: AgentId::new("general-subagent"),
+                    policy_id: Arc::from("general"),
+                    metadata: BTreeMap::new(),
+                }),
+            },
+        })
+        .with_llm(llm.clone());
+
+        let mut state = RunState::new(RunId::new("run-audit"), AgentId::new("default"));
+        state.transcript.items.push(Item {
+            message: Message::text(MessageRole::User, "Run an audit for the last 24 hours"),
+            metadata: BTreeMap::new(),
+        });
+        let ctx = RunContext::from_state(&state);
+
+        let plan = orch.plan(&ctx).await.expect("plan should succeed");
+        assert!(
+            !llm.saw_router_prompt.load(Ordering::SeqCst),
+            "enabled workspace skill requests should bypass routing delegation"
+        );
+        match plan {
+            Plan::CallTool(call) => assert_eq!(call.name.as_ref(), "file"),
+            other => panic!("expected parent tool call, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_skill_maintenance_request_uses_router() {
+        let llm = Arc::new(ToolCallingLlm::default());
+        let catalog = WorkspaceSkillCatalog::from_skills([crate::skills::WorkspaceSkill {
+            name: Arc::from("audit-skill"),
+            description: Arc::from("reports usage"),
+            path: PathBuf::from("/tmp/audit-skill"),
+            instructions: Arc::from("# Audit Skill\n\nRead audit memory."),
+        }]);
+        let orch = MaxOrchestrator::with_tools(vec![ToolSpec {
+            name: Arc::from("file"),
+            description: Arc::from("read and write files"),
+            input_schema: json!({"type": "object"}),
+            requires_isolation: false,
+        }])
+        .with_skill_catalog(catalog)
+        .with_routing_table(RoutingTable {
+            rules: vec![RoutingRule {
+                domain: TaskDomain::SoftwareDev,
+                description: Arc::from("implementation and repository maintenance"),
+                examples: Vec::new(),
+                dispatch: DispatchTarget::Delegate(SubAgentSpec {
+                    agent_id: AgentId::new("codereview-subagent"),
+                    policy_id: Arc::from("code-fix"),
+                    metadata: BTreeMap::new(),
+                }),
+            }],
+            fallback: RoutingRule {
+                domain: TaskDomain::General,
+                description: Arc::from("fallback"),
+                examples: Vec::new(),
+                dispatch: DispatchTarget::Direct,
+            },
+        })
+        .with_llm(llm.clone());
+
+        let mut state = RunState::new(RunId::new("run-audit-maintenance"), AgentId::new("default"));
+        state.transcript.items.push(Item {
+            message: Message::text(
+                MessageRole::User,
+                "Reconstruct audit-skill via analysis of log files",
+            ),
+            metadata: BTreeMap::new(),
+        });
+        let ctx = RunContext::from_state(&state);
+
+        let plan = orch.plan(&ctx).await.expect("plan should succeed");
+        assert!(
+            llm.saw_router_prompt.load(Ordering::SeqCst),
+            "skill maintenance should route to the appropriate sub-agent"
+        );
+        match plan {
+            Plan::Delegate(spec) => {
+                assert_eq!(spec.agent_id.as_str(), "codereview-subagent");
+                assert_eq!(spec.policy_id.as_ref(), "code-fix");
+            }
+            other => panic!("expected delegated maintenance request, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_diagnostic_request_stays_in_parent_llm_path() {
+        let llm = Arc::new(ToolCallingLlm::default());
+        let orch = MaxOrchestrator::with_tools(vec![ToolSpec {
+            name: Arc::from("file"),
+            description: Arc::from("read and write files"),
+            input_schema: json!({"type": "object"}),
+            requires_isolation: false,
+        }])
+        .with_routing_table(RoutingTable {
+            rules: vec![RoutingRule {
+                domain: TaskDomain::Research,
+                description: Arc::from("research and investigation"),
+                examples: Vec::new(),
+                dispatch: DispatchTarget::Delegate(SubAgentSpec {
+                    agent_id: AgentId::new("research-subagent"),
+                    policy_id: Arc::from("research"),
+                    metadata: BTreeMap::new(),
+                }),
+            }],
+            fallback: RoutingRule {
+                domain: TaskDomain::General,
+                description: Arc::from("fallback"),
+                examples: Vec::new(),
+                dispatch: DispatchTarget::Delegate(SubAgentSpec {
+                    agent_id: AgentId::new("general-subagent"),
+                    policy_id: Arc::from("general"),
+                    metadata: BTreeMap::new(),
+                }),
+            },
+        })
+        .with_llm(llm.clone());
+
+        let mut state = RunState::new(RunId::new("run-diagnostics"), AgentId::new("default"));
+        state.transcript.items.push(Item {
+            message: Message::text(
+                MessageRole::User,
+                "list the files the audit-skill explored, and investigate the memory configuration, sessions and logging",
+            ),
+            metadata: BTreeMap::new(),
+        });
+        let ctx = RunContext::from_state(&state);
+
+        let plan = orch.plan(&ctx).await.expect("plan should succeed");
+        assert!(
+            !llm.saw_router_prompt.load(Ordering::SeqCst),
+            "workspace diagnostics should bypass research delegation"
+        );
+        match plan {
+            Plan::CallTool(call) => assert_eq!(call.name.as_ref(), "file"),
+            other => panic!("expected parent tool call, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn validation_failure_returns_to_tool_aware_llm_path() {
+        let llm = Arc::new(ToolCallingLlm::default());
+        let catalog = WorkspaceSkillCatalog::from_skills([crate::skills::WorkspaceSkill {
+            name: Arc::from("skill-creator"),
+            description: Arc::from("creates skills"),
+            path: PathBuf::from("/tmp/skill-creator"),
+            instructions: Arc::from("# Skill Creator\n\nFix validation failures and retry."),
+        }]);
+        let orch = MaxOrchestrator::with_tools(vec![ToolSpec {
+            name: Arc::from("file"),
+            description: Arc::from("read and write files"),
+            input_schema: json!({"type": "object"}),
+            requires_isolation: false,
+        }])
+        .with_skill_catalog(catalog)
+        .with_llm(llm.clone());
+
+        let validate_call = ToolCall {
+            id: ToolCallId::new("skill-creator-validate-audit-skill"),
+            name: Arc::from("skill_validate"),
+            args: RawValue::from_string(json!({ "name": "audit-skill" }).to_string())
+                .expect("raw args"),
+        };
+        let mut state = RunState::new(RunId::new("run-skill"), AgentId::new("default"));
+        state.transcript.items.push(Item {
+            message: Message::text(MessageRole::User, "create a 'audit-skill'"),
+            metadata: BTreeMap::new(),
+        });
+        state.transcript.items.push(Item {
+            message: Message {
+                role: MessageRole::Assistant,
+                content: Arc::from(""),
+                attachments: Vec::new(),
+                tool_calls: vec![validate_call.clone()],
+                tool_call_id: None,
+                metadata: BTreeMap::new(),
+            },
+            metadata: BTreeMap::new(),
+        });
+        let mut tool_metadata = BTreeMap::new();
+        tool_metadata.insert(
+            Arc::from("tool_status"),
+            serde_json::Value::String("failed".to_owned()),
+        );
+        state.transcript.items.push(Item {
+            message: Message {
+                role: MessageRole::Tool,
+                content: Arc::from("skill_validate: FAIL - body is missing"),
+                attachments: Vec::new(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some(validate_call.id),
+                metadata: tool_metadata,
+            },
+            metadata: BTreeMap::new(),
+        });
+        let ctx = RunContext::from_state(&state);
+
+        let plan = orch.plan(&ctx).await.expect("plan should succeed");
+        assert!(
+            !llm.saw_router_prompt.load(Ordering::SeqCst),
+            "tool-result repair should not invoke the router"
+        );
+        match plan {
+            Plan::CallTool(call) => assert_eq!(call.name.as_ref(), "file"),
+            other => panic!("expected repair file tool call, got {other:?}"),
+        }
+    }
+
+    #[derive(Default)]
+    struct ToolCallingLlm {
+        saw_router_prompt: AtomicBool,
+    }
+
+    #[async_trait]
+    impl Llm for ToolCallingLlm {
+        async fn complete(&self, _ctx: &RunContext<'_>) -> Result<Message, LlmError> {
+            Ok(Message::text(MessageRole::Assistant, "unused"))
+        }
+
+        async fn complete_messages(
+            &self,
+            _messages: &[Message],
+            tools: &[ToolSpec],
+        ) -> Result<Message, LlmError> {
+            if tools.is_empty() {
+                self.saw_router_prompt.store(true, Ordering::SeqCst);
+                return Ok(Message::text(
+                    MessageRole::Assistant,
+                    r#"{"domain":"software_dev","confidence":1.0}"#,
+                ));
+            }
+            let args = RawValue::from_string(
+                json!({
+                    "operation": "write",
+                    "path": "skills/rss-digest/SKILL.md",
+                    "content": "---\nname: rss-digest\ndescription: Summarize feeds.\n---\n",
+                })
+                .to_string(),
+            )
+            .expect("raw args");
+            let mut message = Message::text(MessageRole::Assistant, "");
+            message.tool_calls.push(ToolCall {
+                id: ToolCallId::new("call-file"),
+                name: Arc::from("file"),
+                args,
+            });
+            Ok(message)
+        }
     }
 }
