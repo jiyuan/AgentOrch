@@ -1,5 +1,0 @@
-{"active_agent":"echo-agent","event":"session_started","phase":"resume","run_id":"cli-run-1"}
-{"active_agent":"echo-agent","event":"session_started","phase":"resume","run_id":"cli-run-1"}
-{"event":"transcript_item","index":0,"message":{"content":"cli-tool","metadata":{"bytes_out":8,"duration_ms":1,"exit_code":0,"stderr_bytes":0,"tool_call_id":"call-1","tool_status":"succeeded"},"role":"tool"},"metadata":{},"phase":"finished"}
-{"event":"transcript_item","index":1,"message":{"content":"cli-tool","role":"assistant"},"metadata":{},"phase":"finished"}
-{"event":"session_finished","phase":"finished"}

@@ -38,7 +38,7 @@
 # User's files
 /workspace/*
 !/workspace/agent.toml
-!/workspace/skills/
+#!/workspace/skills/
 !/workspace/subagents/
 !/workspace/suborchs/
 
